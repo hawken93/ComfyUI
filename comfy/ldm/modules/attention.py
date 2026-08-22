@@ -861,7 +861,7 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
         )
     return out
 
-def optimized_attention_for_device(device, mask=False, small_input=False):
+def optimized_attention_for_device(device, small_input=False):
     if small_input:
         if model_management.pytorch_attention_enabled(device):
             return attention_pytorch #TODO: need to confirm but this is probably slightly faster for small inputs in all cases
@@ -870,10 +870,6 @@ def optimized_attention_for_device(device, mask=False, small_input=False):
 
     if device == torch.device("cpu"):
         return attention_sub_quad
-
-
-    # TODO: mask does not do anything today
-    # Might in the future, so the parameter has been maintaned
 
     if model_management.comfy_kitchen_attention_enabled():
         # TODO(comfy_kitchen): Relies on the assumption that either nvidia or amd is supported (see _hip_backend), and
@@ -911,8 +907,7 @@ class CrossAttention(nn.Module):
         self.heads = heads
         self.dim_head = dim_head
 
-        self.oa = optimized_attention_for_device(device, False)
-        self.oam = optimized_attention_for_device(device, True)
+        self.oa = optimized_attention_for_device(device)
 
         self.to_q = operations.Linear(query_dim, inner_dim, bias=False, dtype=dtype, device=device)
         self.to_k = operations.Linear(context_dim, inner_dim, bias=False, dtype=dtype, device=device)
@@ -930,10 +925,7 @@ class CrossAttention(nn.Module):
         else:
             v = self.to_v(context)
 
-        if mask is None:
-            out = self.oa(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
-        else:
-            out = self.oam(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
+        out = self.oa(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
         return self.to_out(out)
 
 
