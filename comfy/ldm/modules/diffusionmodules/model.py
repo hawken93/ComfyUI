@@ -1,3 +1,10 @@
+# TODO: this file does not know which device AttnBlock / vae_attention() run on.
+# The no-arg xformers_enabled_vae() in vae_attention() (and other no-arg
+# xformers_enabled() / is_*() calls in this file) are machine-level and must
+# become per-device, threaded through from where the block learns its device.
+# As-is, a machine-level check wrongly enables xformers-VAE on an XPU block just
+# because a CUDA device exists in the process. Parked migration follow-up; the
+# module-level xformers import gate below is already device-independent.
 # pytorch_diffusion + derived encoder decoder
 import math
 import torch
@@ -9,7 +16,7 @@ from comfy import model_management
 import comfy.ops
 ops = comfy.ops.disable_weight_init
 
-if model_management.xformers_enabled_vae():
+if model_management.XFORMERS_IS_AVAILABLE and model_management.XFORMERS_ENABLED_VAE:
     import xformers
     import xformers.ops
 

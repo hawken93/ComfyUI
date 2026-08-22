@@ -17,7 +17,7 @@ from .sub_quadratic_attention import efficient_dot_product_attention
 
 from comfy import model_management
 
-if model_management.xformers_enabled():
+if model_management.XFORMERS_IS_AVAILABLE:
     import xformers
     import xformers.ops
 
@@ -35,6 +35,8 @@ except ImportError as e:
             raise e
         exit(-1)
 
+# IS_AVAILABLE means it imported, not necessarily
+# saying where it will run
 SAGE_ATTENTION3_IS_AVAILABLE = False
 try:
     from sageattn3 import sageattn3_blackwell
@@ -51,25 +53,38 @@ except ImportError:
         logging.error(f"\n\nTo use the `--use-flash-attention` feature, the `flash-attn` package must be installed first.\ncommand:\n\t{sys.executable} -m pip install flash-attn")
         exit(-1)
 
-COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = comfy_kitchen.int8_attention_is_available()
+def _is_blackwell(dev):
+    if not model_management.is_nvidia(dev):
+        return False
+    return torch.cuda.get_device_capability(dev).major >= 10
 
-REGISTERED_ATTENTION_FUNCTIONS = {}
-def register_attention_function(name: str, func: Callable):
-    # avoid replacing existing functions
-    if name not in REGISTERED_ATTENTION_FUNCTIONS:
-        REGISTERED_ATTENTION_FUNCTIONS[name] = func
-    else:
-        logging.warning(f"Attention function {name} already registered, skipping registration.")
-
-def get_attention_function(name: str, default: Any=...) -> Union[Callable, None]:
+def get_attention_function(name: str, dev, default: Any=...) -> Union[Callable, None]:
     if name == "optimized":
-        return optimized_attention
-    elif name not in REGISTERED_ATTENTION_FUNCTIONS:
-        if default is ...:
-            raise KeyError(f"Attention function {name} not found.")
-        else:
-            return default
-    return REGISTERED_ATTENTION_FUNCTIONS[name]
+        return optimized_attention_for_device(dev)
+    # TODO(comfy_kitchen): Relies on the assumption that either nvidia or amd is supported (see _hip_backend), and on
+    # AMD reports available only if every visible amd device has matrix cores. Both need a per-device fix in
+    # comfy_kitchen, out of scope here.
+    elif name == "comfy_kitchen_int8" and comfy_kitchen.int8_attention_is_available(dev):
+        return attention_comfy_kitchen_int8
+    elif name == "sage3" and SAGE_ATTENTION3_IS_AVAILABLE and _is_blackwell(dev):
+        return attention3_sage
+    elif name == "xformers" and model_management.xformers_enabled(dev):
+        return attention_xformers
+    elif name == "flash" and FLASH_ATTENTION_IS_AVAILABLE:
+        return attention_flash
+    elif name == "sage" and SAGE_ATTENTION_IS_AVAILABLE:
+        return attention_sage
+    elif name == "split":
+        return attention_split
+    elif name == "sub_quad":
+        return attention_sub_quad
+    elif name == "pytorch":
+        return attention_pytorch
+    elif default is ...:
+        raise KeyError(f"Attention function {name} not found.")
+    else:
+        return default
+
 
 from comfy.cli_args import args
 import comfy.ops
@@ -413,7 +428,7 @@ def attention_split(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
             for i in range(0, q.shape[1], slice_size):
                 end = i + slice_size
                 if upcast:
-                    with torch.autocast(enabled=False, device_type = 'cuda'):
+                    with torch.autocast(enabled=False, device_type=q.device.type):
                         s1 = einsum('b i d, b j d -> b i j', q[:, i:end].float(), k.float()) * scale
                 else:
                     s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * scale
@@ -535,12 +550,6 @@ def attention_xformers(q, k, v, heads, mask=None, attn_precision=None, skip_resh
 
     return out
 
-if model_management.is_nvidia(): #pytorch 2.3 and up seem to have this issue.
-    SDP_BATCH_LIMIT = 2**15
-else:
-    #TODO: other GPUs ?
-    SDP_BATCH_LIMIT = 2**31
-
 @wrap_attn
 def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
     if skip_reshape:
@@ -562,7 +571,10 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
     sdpa_keys = ("scale", "enable_gqa")
     sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
 
-    if SDP_BATCH_LIMIT >= b:
+    # pytorch 2.3 and up seem to have this issue on nvidia
+    sdp_batch_limit = 2**15 if model_management.is_nvidia(q.device) else 2**31
+
+    if sdp_batch_limit >= b:
         out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)
         if not skip_output_reshape:
             out = (
@@ -570,16 +582,16 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
             )
     else:
         out = torch.empty((b, q.shape[2], heads * dim_head), dtype=q.dtype, layout=q.layout, device=q.device)
-        for i in range(0, b, SDP_BATCH_LIMIT):
+        for i in range(0, b, sdp_batch_limit):
             m = mask
             if mask is not None:
                 if mask.shape[0] > 1:
-                    m = mask[i : i + SDP_BATCH_LIMIT]
+                    m = mask[i : i + sdp_batch_limit]
 
-            out[i : i + SDP_BATCH_LIMIT] = comfy.ops.scaled_dot_product_attention(
-                q[i : i + SDP_BATCH_LIMIT],
-                k[i : i + SDP_BATCH_LIMIT],
-                v[i : i + SDP_BATCH_LIMIT],
+            out[i : i + sdp_batch_limit] = comfy.ops.scaled_dot_product_attention(
+                q[i : i + sdp_batch_limit],
+                k[i : i + sdp_batch_limit],
+                v[i : i + sdp_batch_limit],
                 attn_mask=m,
                 dropout_p=0.0, is_causal=False, **sdpa_extra
             ).transpose(1, 2).reshape(-1, q.shape[2], heads * dim_head)
@@ -849,59 +861,9 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
         )
     return out
 
-
-optimized_attention = attention_basic
-
-if model_management.sage_attention_enabled():
-    logging.info("Using sage attention")
-    optimized_attention = attention_sage
-elif model_management.flash_attention_enabled():
-    logging.info("Using Flash Attention")
-    optimized_attention = attention_flash
-elif model_management.xformers_enabled():
-    logging.info("Using xformers attention")
-    optimized_attention = attention_xformers
-elif model_management.pytorch_attention_enabled():
-    logging.info("Using pytorch attention")
-    optimized_attention = attention_pytorch
-else:
-    if args.use_split_cross_attention:
-        logging.info("Using split optimization for attention")
-        optimized_attention = attention_split
-    else:
-        logging.info("Using sub quadratic optimization for attention, if you have memory or speed issues try using: --use-split-cross-attention")
-        optimized_attention = attention_sub_quad
-
-if model_management.comfy_kitchen_attention_enabled():
-    if COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE:
-        logging.info("Using Comfy Kitchen attention")
-        optimized_attention = attention_comfy_kitchen_int8
-    else:
-        logging.error("Comfy Kitchen attention is unavailable. Install a Comfy Kitchen build with attention support to use --use-ck-attention.")
-        exit(-1)
-
-optimized_attention_masked = optimized_attention
-
-
-# register core-supported attention functions
-if COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE:
-    register_attention_function("comfy_kitchen_int8", attention_comfy_kitchen_int8)
-if SAGE_ATTENTION_IS_AVAILABLE:
-    register_attention_function("sage", attention_sage)
-if SAGE_ATTENTION3_IS_AVAILABLE:
-    register_attention_function("sage3", attention3_sage)
-if FLASH_ATTENTION_IS_AVAILABLE:
-    register_attention_function("flash", attention_flash)
-if model_management.xformers_enabled():
-    register_attention_function("xformers", attention_xformers)
-register_attention_function("pytorch", attention_pytorch)
-register_attention_function("sub_quad", attention_sub_quad)
-register_attention_function("split", attention_split)
-
-
 def optimized_attention_for_device(device, mask=False, small_input=False):
     if small_input:
-        if model_management.pytorch_attention_enabled():
+        if model_management.pytorch_attention_enabled(device):
             return attention_pytorch #TODO: need to confirm but this is probably slightly faster for small inputs in all cases
         else:
             return attention_basic
@@ -909,10 +871,34 @@ def optimized_attention_for_device(device, mask=False, small_input=False):
     if device == torch.device("cpu"):
         return attention_sub_quad
 
-    if mask:
-        return optimized_attention_masked
 
-    return optimized_attention
+    # TODO: mask does not do anything today
+    # Might in the future, so the parameter has been maintaned
+
+    if model_management.comfy_kitchen_attention_enabled():
+        # TODO(comfy_kitchen): Relies on the assumption that either nvidia or amd is supported (see _hip_backend), and
+        # on AMD reports available only if every visible amd device has matrix cores. Both need a per-device fix in
+        # comfy_kitchen, out of scope here.
+        if comfy_kitchen.int8_attention_is_available(device):
+            logging.info("Using Comfy Kitchen attention")
+            return attention_comfy_kitchen_int8
+        else:
+            logging.error("Comfy Kitchen attention is unavailable. Install a Comfy Kitchen build with attention support to use --use-ck-attention.")
+            exit(-1)
+    elif SAGE_ATTENTION_IS_AVAILABLE and model_management.sage_attention_enabled():
+        return attention_sage
+    elif FLASH_ATTENTION_IS_AVAILABLE and model_management.flash_attention_enabled():
+        return attention_flash
+    elif model_management.xformers_enabled(device):
+        return attention_xformers
+    elif model_management.pytorch_attention_enabled(device):
+        return attention_pytorch
+    else:
+        if args.use_split_cross_attention:
+            return attention_split
+        else:
+            logging.info("Using sub quadratic optimization for attention, if you have memory or speed issues try using: --use-split-cross-attention")
+            return attention_sub_quad
 
 
 class CrossAttention(nn.Module):
@@ -924,6 +910,9 @@ class CrossAttention(nn.Module):
 
         self.heads = heads
         self.dim_head = dim_head
+
+        self.oa = optimized_attention_for_device(device, False)
+        self.oam = optimized_attention_for_device(device, True)
 
         self.to_q = operations.Linear(query_dim, inner_dim, bias=False, dtype=dtype, device=device)
         self.to_k = operations.Linear(context_dim, inner_dim, bias=False, dtype=dtype, device=device)
@@ -942,9 +931,9 @@ class CrossAttention(nn.Module):
             v = self.to_v(context)
 
         if mask is None:
-            out = optimized_attention(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
+            out = self.oa(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
         else:
-            out = optimized_attention_masked(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
+            out = self.oam(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
         return self.to_out(out)
 
 
