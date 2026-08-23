@@ -1120,6 +1120,7 @@ class NaDiT(nn.Module):
 
     def __init__(
         self,
+        device,
         norm_eps,
         num_layers,
         mlp_type,
@@ -1137,7 +1138,6 @@ class NaDiT(nn.Module):
         rope_type = "mmrope3d",
         vid_out_norm: Optional[str] = None,
         image_model = None,
-        device = None,
         dtype = None,
         operations = None,
     ):

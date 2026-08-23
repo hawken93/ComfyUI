@@ -119,6 +119,7 @@ class PixDiT_T2I(nn.Module):
     """
     def __init__(
         self,
+        device,
         in_channels=3,
         num_groups=24,
         hidden_size=1536,
@@ -134,7 +135,6 @@ class PixDiT_T2I(nn.Module):
         text_rope_theta=10000.0,
         image_model=None,
         dtype=None,
-        device=None,
         operations=None,
         pixel_mlp_chunks=2,
     ):

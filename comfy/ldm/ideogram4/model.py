@@ -224,9 +224,9 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
     Runs a packed ``[text, image]`` sequence when text context is supplied, or an image-only sequence when ``context is None``.
     """
 
-    def __init__(self, image_model=None, in_channels=128, num_layers=34, num_attention_heads=18, attention_head_dim=256, intermediate_size=12288,
+    def __init__(self, device, image_model=None, in_channels=128, num_layers=34, num_attention_heads=18, attention_head_dim=256, intermediate_size=12288,
                  adaln_dim=512, llm_features_dim=53248, rope_theta=5000000, mrope_section=(24, 20, 20), norm_eps=1e-5,
-                 dtype=None, device=None, operations=None, **kwargs):
+                 dtype=None, operations=None, **kwargs):
         emb_dim = num_attention_heads * attention_head_dim
         super().__init__(
             emb_dim=emb_dim, num_layers=num_layers, num_heads=num_attention_heads,

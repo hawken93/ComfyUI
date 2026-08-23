@@ -483,7 +483,7 @@ class CLIP:
         return self.patcher.is_dynamic()
 
 class VAE:
-    def __init__(self, sd=None, device=None, config=None, dtype=None, metadata=None):
+    def __init__(self, device, sd=None, config=None, dtype=None, metadata=None):
         is_seedvr2_vae = "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd
         if not is_seedvr2_vae and 'decoder.up_blocks.0.resnets.0.norm1.weight' in sd.keys(): #diffusers format
             sd = diffusers_convert.convert_vae_state_dict(sd)
@@ -576,7 +576,7 @@ class VAE:
                 self.downscale_ratio = 32
                 self.latent_channels = 16
             elif "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd: # seedvr2
-                self.first_stage_model = comfy.ldm.seedvr.vae.VideoAutoencoderKLWrapper(model_management.vae_device())
+                self.first_stage_model = comfy.ldm.seedvr.vae.VideoAutoencoderKLWrapper(device)
                 self.latent_channels = comfy.ldm.seedvr.vae.SEEDVR2_LATENT_CHANNELS
                 self.latent_dim = 3
                 self.disable_offload = True
@@ -713,7 +713,7 @@ class VAE:
                     sd = comfy.utils.state_dict_prefix_replace(sd, {"": "decoder."})
                 if "layers.4.layers.1.attn_block.attn.qkv.weight" in sd:
                     sd = comfy.utils.state_dict_prefix_replace(sd, {"": "encoder."})
-                self.first_stage_model = comfy.ldm.genmo.vae.model.VideoVAE(model_management.vae_device())
+                self.first_stage_model = comfy.ldm.genmo.vae.model.VideoVAE(device)
                 self.latent_channels = 12
                 self.latent_dim = 3
                 self.memory_used_decode = lambda shape, dtype: (1000 * shape[2] * shape[3] * shape[4] * (6 * 8 * 8)) * model_management.dtype_size(dtype)
@@ -986,7 +986,7 @@ class VAE:
                 minimax_quant = comfy.utils.detect_layer_quantization(sd, "")
                 if minimax_quant is not None:  # int8+convrot quantized decoder
                     minimax_ops = comfy.ops.mixed_precision_ops(minimax_quant, dtype if dtype is not None else torch.float16)
-                self.first_stage_model = comfy.ldm.minimax.vae.MiniMaxH3VideoVAE(operations=minimax_ops)
+                self.first_stage_model = comfy.ldm.minimax.vae.MiniMaxH3VideoVAE(device, operations=minimax_ops)
                 self.latent_channels = 24
                 self.latent_dim = 3
                 # frames 17k+5 <-> latents 5k+2, 16x spatial
@@ -1055,10 +1055,8 @@ class VAE:
             self.first_stage_model = AutoencoderKL(**(config['params']))
         self.first_stage_model = self.first_stage_model.eval()
 
-        if device is None:
-            device = model_management.vae_device()
-        self.device = device
-        offload_device = model_management.vae_offload_device()
+        self.device = model_management.vae_device(device)
+        offload_device = model_management.vae_offload_device(device)
         if dtype is None:
             dtype = model_management.vae_dtype(self.device, self.working_dtypes)
         self.vae_dtype = dtype

@@ -442,6 +442,7 @@ class NextDiT(nn.Module):
 
     def __init__(
         self,
+        device,
         patch_size: int = 2,
         in_channels: int = 4,
         dim: int = 4096,
@@ -463,7 +464,6 @@ class NextDiT(nn.Module):
         clip_text_dim=None,
         siglip_feat_dim=None,
         image_model=None,
-        device=None,
         dtype=None,
         operations=None,
         **kwargs,
@@ -1002,6 +1002,7 @@ class NextDiTPixelSpace(NextDiT):
 
     def __init__(
         self,
+        device,
         # decoder-specific
         decoder_hidden_size: int = 3840,
         decoder_num_res_blocks: int = 4,
@@ -1011,7 +1012,7 @@ class NextDiTPixelSpace(NextDiT):
         # all NextDiT args forwarded unchanged
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(device, **kwargs)
 
         # Remove the latent-space final layer – not used in pixel space
         del self.final_layer

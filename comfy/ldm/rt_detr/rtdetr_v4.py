@@ -692,7 +692,7 @@ class DFINETransformer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RTv4(nn.Module):
-    def __init__(self, num_classes=80, num_queries=300, enc_h=256, dec_h=256, enc_ff=2048, dec_ff=1024, feat_strides=[8, 16, 32], device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, num_classes=80, num_queries=300, enc_h=256, dec_h=256, enc_ff=2048, dec_ff=1024, feat_strides=[8, 16, 32], dtype=None, operations=None, **kwargs):
         super().__init__()
         self.device = device
         self.dtype = dtype

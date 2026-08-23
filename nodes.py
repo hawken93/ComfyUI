@@ -651,14 +651,15 @@ class DiffusersLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"model_path": (cls._model_paths(),), }}
+        return {"required": {"model_path": (cls._model_paths(),),},
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True})}}
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     FUNCTION = "load_checkpoint"
     DEPRECATED = True
 
     CATEGORY = "model/loaders"
 
-    def load_checkpoint(self, model_path, output_vae=True, output_clip=True):
+    def load_checkpoint(self, model_path, output_vae=True, output_clip=True, device="default"):
         if model_path not in self._model_paths():
             raise ValueError(f"Invalid diffusers model path: {model_path!r}")
 
@@ -672,7 +673,10 @@ class DiffusersLoader:
         if resolved_model_path is None:
             raise FileNotFoundError(f"Diffusers model {model_path!r} not found.")
 
-        return comfy.diffusers_load.load_diffusers(resolved_model_path, output_vae=output_vae, output_clip=output_clip, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+        # The raw device option string is passed through: the VAE weights are
+        # only loaded inside load_diffusers, so device resolution (with the
+        # VAE's size and dtype) happens there, not in the node.
+        return comfy.diffusers_load.load_diffusers(device, resolved_model_path, output_vae=output_vae, output_clip=output_clip, embedding_directory=folder_paths.get_folder_paths("embeddings"))
 
 
 class unCLIPCheckpointLoader:
@@ -768,6 +772,20 @@ class LoraLoaderModelOnly(LoraLoader):
         return (self.load_lora(model, None, lora_name, strength_model, 0)[0],)
 
 class VAELoader:
+    # Reference example for giving the user control over a model's target
+    # device while still picking a suitable one by default.
+    #
+    #   * INPUT_TYPES exposes an advanced, optional `device` widget built from
+    #     get_gpu_device_options(): "default", "cpu", plus one entry per
+    #     visible accelerator. Leaving it on "default" keeps auto-selection.
+    #   * load_vae first loads the state dict, then resolves the device with
+    #     pick_device_for_option, feeding it the VAE's real size and dtype so
+    #     the default picks a device that both supports the dtype and has room.
+    #     A concrete user pick is honored as-is (resolve_gpu_device_option)
+    #     and only falls back to auto-pick when that device is unavailable.
+    #
+    # New device-aware loaders should follow this shape: optional `device`
+    # widget in, resolved torch.device out to the model constructor.
     video_taes = ["taehv", "lighttaew2_2", "lighttaew2_1", "lighttaehy1_5", "taeltx_2", "taeh3"]
     image_taes = ["taesd", "taesdxl", "taesd3", "taef1", "taef2"]
 
@@ -824,14 +842,15 @@ class VAELoader:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "vae_name": (s.vae_list(s), )}}
+        return {"required": { "vae_name": (s.vae_list(s), )},
+                "optional": { "device": (comfy.model_management.get_gpu_device_options(), {"advanced": True}) }}
     RETURN_TYPES = ("VAE",)
     FUNCTION = "load_vae"
 
     CATEGORY = "model/loaders"
 
     #TODO: scale factor?
-    def load_vae(self, vae_name):
+    def load_vae(self, vae_name, device="default"):
         metadata = None
         vae_path = None
         if vae_name == "pixel_space":
@@ -850,7 +869,16 @@ class VAELoader:
                 metadata = {"tae_latent_channels": 128}
             else:
                 metadata["tae_latent_channels"] = 128
-        vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+        # Resolve the device now that the weights are in hand: use the loaded
+        # size/dtype so the default lands on a device with the capability and
+        # free memory to hold this VAE. An explicit user pick short-circuits
+        # straight to that device.
+        dtype = comfy.utils.weight_dtype(sd)
+        device = comfy.model_management.pick_device_for_option(
+            device,
+            memory_required=comfy.utils.calculate_parameters(sd) * comfy.model_management.dtype_size(dtype),
+            dtype=dtype)
+        vae = comfy.sd.VAE(device=device, sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
         # Register a reload factory on the patcher so multigpu deepclones
         # (Select VAE Device, future MultiGPU VAE work-units) can produce

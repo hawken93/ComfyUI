@@ -274,10 +274,11 @@ class TransformerDecoderBlock(nn.Module):
 class Kandinsky5(nn.Module):
     def __init__(
         self,
+        device,
         in_visual_dim=16, out_visual_dim=16, in_text_dim=3584, in_text_dim2=768, time_dim=512,
         model_dim=1792, ff_dim=7168, visual_embed_dim=132, patch_size=(1, 2, 2), num_text_blocks=2, num_visual_blocks=32,
         axes_dims=(16, 24, 24), rope_scale_factor=(1.0, 2.0, 2.0),
-        dtype=None, device=None, operations=None, **kwargs
+        dtype=None, operations=None, **kwargs
     ):
         super().__init__()
         head_dim = sum(axes_dims)

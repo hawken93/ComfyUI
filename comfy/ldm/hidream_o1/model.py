@@ -94,7 +94,7 @@ class FinalLayer(nn.Module):
 class HiDreamO1Transformer(nn.Module):
     """HiDream-O1 unified pixel-level transformer."""
 
-    def __init__(self, image_model=None, dtype=None, device=None, operations=None,
+    def __init__(self, device, image_model=None, dtype=None, operations=None,
                  text_config_overrides=None, vision_config_overrides=None, **kwargs):
         super().__init__()
         self.dtype = dtype

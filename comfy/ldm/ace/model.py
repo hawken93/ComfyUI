@@ -149,6 +149,7 @@ class ACEStepTransformer2DModel(nn.Module):
 
     def __init__(
         self,
+        device,
         in_channels: Optional[int] = 8,
         num_layers: int = 28,
         inner_dim: int = 1536,
@@ -169,7 +170,7 @@ class ACEStepTransformer2DModel(nn.Module):
         max_height: int = 16,
         max_width: int = 4096,
         audio_model=None,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
 
     ):
         super().__init__()

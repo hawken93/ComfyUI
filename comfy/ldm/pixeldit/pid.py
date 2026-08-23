@@ -158,6 +158,7 @@ class PidNet(PixDiT_T2I):
 
     def __init__(
         self,
+        device,
         lq_latent_channels: int = 16,
         lq_hidden_dim: int = 512,
         lq_num_res_blocks: int = 4,
@@ -171,10 +172,10 @@ class PidNet(PixDiT_T2I):
         rope_ref_h: int = 1024, # NTK ref resolution in PIXEL units: 1024px / patch=16 -> grid_ref=64.
         rope_ref_w: int = 1024,
         image_model=None,
-        dtype=None, device=None, operations=None,
+        dtype=None, operations=None,
         **pixdit_kwargs,
     ):
-        super().__init__(dtype=dtype, device=device, operations=operations, **pixdit_kwargs)
+        super().__init__(device, dtype=dtype, operations=operations, **pixdit_kwargs)
 
         self.rope_ref_grid_h = rope_ref_h // self.patch_size
         self.rope_ref_grid_w = rope_ref_w // self.patch_size

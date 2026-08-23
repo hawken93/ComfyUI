@@ -29,6 +29,7 @@ class RotaryEmbedding(nn.Module):
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
+        # TODO review torch.autocast: mps -> cpu?
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
@@ -143,6 +144,7 @@ class TransformerBlock(nn.Module):
 class LLMAdapter(nn.Module):
     def __init__(
             self,
+            device,
             source_dim=1024,
             target_dim=1024,
             model_dim=1024,
@@ -150,7 +152,6 @@ class LLMAdapter(nn.Module):
             num_heads=16,
             use_self_attn=True,
             layer_norm=False,
-            device=None,
             dtype=None,
             operations=None,
         ):
@@ -191,9 +192,9 @@ class LLMAdapter(nn.Module):
 
 
 class Anima(MiniTrainDIT):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.llm_adapter = LLMAdapter(device=kwargs.get("device"), dtype=kwargs.get("dtype"), operations=kwargs.get("operations"))
+    def __init__(self, device, *args, **kwargs):
+        super().__init__(device, *args, **kwargs)
+        self.llm_adapter = LLMAdapter(device, dtype=kwargs.get("dtype"), operations=kwargs.get("operations"))
 
     def preprocess_text_embeds(self, text_embeds, text_ids, t5xxl_weights=None):
         if text_ids is not None:

@@ -413,6 +413,7 @@ class WanModel(torch.nn.Module):
     """
 
     def __init__(self,
+                 device,
                  model_type='t2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -432,7 +433,6 @@ class WanModel(torch.nn.Module):
                  in_dim_ref_conv=None,
                  wan_attn_block_class=WanAttentionBlock,
                  image_model=None,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):
@@ -739,6 +739,7 @@ class VaceWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
                  model_type='vace',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -758,7 +759,6 @@ class VaceWanModel(WanModel):
                  image_model=None,
                  vace_layers=None,
                  vace_in_dim=None,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):
@@ -866,6 +866,7 @@ class CameraWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
                  model_type='camera',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -884,7 +885,6 @@ class CameraWanModel(WanModel):
                  flf_pos_embed_token_number=None,
                  image_model=None,
                  in_dim_control_adapter=24,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):
@@ -1282,6 +1282,7 @@ class FramePackMotioner(nn.Module):
 
 class WanModel_S2V(WanModel):
     def __init__(self,
+                 device,
                  model_type='s2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -1305,7 +1306,6 @@ class WanModel_S2V(WanModel):
                  adain_mode="attn_norm",
                  framepack_drop_mode="padd",
                  image_model=None,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):
@@ -1598,6 +1598,7 @@ class HumoWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
                  model_type='humo',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -1616,7 +1617,6 @@ class HumoWanModel(WanModel):
                  flf_pos_embed_token_number=None,
                  image_model=None,
                  audio_token_num=16,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):
@@ -1700,7 +1700,7 @@ class HumoWanModel(WanModel):
         return x
 
 class SCAILWanModel(WanModel):
-    def __init__(self, model_type="scail", patch_size=(1, 2, 2), in_dim=20, dim=5120, operations=None, device=None, dtype=None, **kwargs):
+    def __init__(self, device, model_type="scail", patch_size=(1, 2, 2), in_dim=20, dim=5120, operations=None, dtype=None, **kwargs):
         super().__init__(model_type='i2v', patch_size=patch_size, in_dim=in_dim, dim=dim, operations=operations, device=device, dtype=dtype, **kwargs)
 
         self.patch_embedding_pose = operations.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)
@@ -1868,6 +1868,6 @@ class SCAILWanModel(WanModel):
 class SCAIL2WanModel(SCAILWanModel):
     """SCAIL-2: SCAIL-Preview + an additive binary multi-identity mask stream."""
 
-    def __init__(self, model_type="scail2", patch_size=(1, 2, 2), in_dim=20, mask_in_dim=28, dim=5120, operations=None, device=None, dtype=None, **kwargs):
+    def __init__(self, device, model_type="scail2", patch_size=(1, 2, 2), in_dim=20, mask_in_dim=28, dim=5120, operations=None, dtype=None, **kwargs):
         super().__init__(model_type=model_type, patch_size=patch_size, in_dim=in_dim, dim=dim, operations=operations, device=device, dtype=dtype, **kwargs)
         self.patch_embedding_mask = operations.Conv3d(mask_in_dim, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)

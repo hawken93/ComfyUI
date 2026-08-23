@@ -213,11 +213,11 @@ class TimestepEmbedder(nn.Module):
 
 
 class LatentSeqMMFlowModel(nn.Module):
-    def __init__(self, image_model=None, q_token_length=8192, in_channels=16, model_channels=1024,
+    def __init__(self, device, image_model=None, q_token_length=8192, in_channels=16, model_channels=1024,
                  cond_channels=1280, out_channels=16, num_blocks=24, num_refiner_blocks=2,
                  num_heads=None, num_head_channels=64, cam_channels=5, cond2_channels=128,
                  mlp_ratio=4, share_mod=True, qk_rms_norm=True,
-                 dtype=None, device=None, operations=None, **kwargs):
+                 dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         self.q_token_length = q_token_length

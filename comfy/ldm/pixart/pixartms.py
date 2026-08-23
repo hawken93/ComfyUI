@@ -69,6 +69,7 @@ class PixArtMS(nn.Module):
     """
     def __init__(
             self,
+            device,
             input_size=32,
             patch_size=2,
             in_channels=4,
@@ -89,7 +90,6 @@ class PixArtMS(nn.Module):
             qk_norm=False,
             kv_compress_config=None,
             dtype=None,
-            device=None,
             operations=None,
             **kwargs,
     ):

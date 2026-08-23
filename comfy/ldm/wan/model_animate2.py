@@ -232,6 +232,7 @@ class PoseBranchCache:
 class WanAnimate2Model(WanModel):
 
     def __init__(self,
+                 device,
                  model_type='animate2',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -250,7 +251,7 @@ class WanAnimate2Model(WanModel):
                  flf_pos_embed_token_number=None,
                  in_dim_ref_conv=None,
                  image_model=None,
-                 device=None, dtype=None, operations=None,
+                 dtype=None, operations=None,
                  ):
         # model_type is 'animate2' in unet_config, but the checkpoint is i2v-shaped
         super().__init__(model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim,

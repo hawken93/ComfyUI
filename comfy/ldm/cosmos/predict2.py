@@ -610,6 +610,7 @@ class MiniTrainDIT(nn.Module):
 
     def __init__(
         self,
+        device,
         max_img_h: int,
         max_img_w: int,
         max_frames: int,
@@ -617,7 +618,6 @@ class MiniTrainDIT(nn.Module):
         out_channels: int,
         patch_spatial: int,  # tuple,
         patch_temporal: int,
-        device,
         concat_padding_mask: bool = True,
         # attention settings
         model_channels: int = 768,

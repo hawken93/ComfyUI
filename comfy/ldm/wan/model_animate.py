@@ -403,6 +403,7 @@ class AnimateWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
                  model_type='animate',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -421,7 +422,6 @@ class AnimateWanModel(WanModel):
                  flf_pos_embed_token_number=None,
                  motion_encoder_dim=512,
                  image_model=None,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):

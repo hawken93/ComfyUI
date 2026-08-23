@@ -171,6 +171,7 @@ class HunYuanDiT(nn.Module):
     """
     #@register_to_config
     def __init__(self,
+                 device,
                  input_size: tuple = 32,
                  patch_size: int = 2,
                  in_channels: int = 4,
@@ -190,7 +191,6 @@ class HunYuanDiT(nn.Module):
                  log_fn: callable = print,
                  attn_precision=None,
                  dtype=None,
-                 device=None,
                  operations=None,
                  **kwargs,
     ):

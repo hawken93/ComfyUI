@@ -59,6 +59,7 @@ class MusicEncoderLayer(nn.Module):
 
 class WanDancerModel(WanModel):
     def __init__(self,
+                 device,
                  model_type='wandancer',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -76,7 +77,7 @@ class WanDancerModel(WanModel):
                  eps=1e-6,
                  in_dim_ref_conv=None,
                  image_model=None,
-                 device=None, dtype=None, operations=None,
+                 dtype=None, operations=None,
                  audio_inject_layers=[0, 4, 8, 12, 16, 20, 24, 27],
                  music_dim = 256,
                  music_heads = 4,

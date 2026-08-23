@@ -230,10 +230,10 @@ class LastLayer(nn.Module):
 
 
 class SingleStreamDiT(nn.Module):
-    def __init__(self, features=6144, tdim=256, txtdim=2560, heads=48, kvheads=12, multiplier=4,
+    def __init__(self, device, features=6144, tdim=256, txtdim=2560, heads=48, kvheads=12, multiplier=4,
                  layers=28, patch=2, channels=16, bias=False, theta=1e3, txtlayers=12,
                  txtheads=20, txtkvheads=20, default_ref_method=None, image_model=None,
-                 device=None, dtype=None, operations=None, **kwargs):
+                 dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         self.patch = patch

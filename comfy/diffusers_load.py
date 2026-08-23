@@ -9,7 +9,13 @@ def first_file(path, filenames):
             return p
     return None
 
-def load_diffusers(model_path, output_vae=True, output_clip=True, embedding_directory=None):
+def load_diffusers(device: str, model_path, output_vae=True, output_clip=True, embedding_directory=None):
+    # `device` is the raw user device option string from the loader node
+    # ("default", "cpu", or a concrete device id like "cuda:0"), not a
+    # resolved torch.device. It is resolved with pick_device_for_option
+    # right next to the VAE state dict load, where its size and dtype are
+    # known, so the default lands on a device that supports the dtype and
+    # has room for the weights.
     diffusion_model_names = ["diffusion_pytorch_model.fp16.safetensors", "diffusion_pytorch_model.safetensors", "diffusion_pytorch_model.fp16.bin", "diffusion_pytorch_model.bin"]
     unet_path = first_file(os.path.join(model_path, "unet"), diffusion_model_names)
     vae_path = first_file(os.path.join(model_path, "vae"), diffusion_model_names)
@@ -31,6 +37,11 @@ def load_diffusers(model_path, output_vae=True, output_clip=True, embedding_dire
     vae = None
     if output_vae:
         sd = comfy.utils.load_torch_file(vae_path)
-        vae = comfy.sd.VAE(sd=sd)
+        dtype = comfy.utils.weight_dtype(sd)
+        device = comfy.model_management.pick_device_for_option(
+            device,
+            memory_required=comfy.utils.calculate_parameters(sd) * comfy.model_management.dtype_size(dtype),
+            dtype=dtype)
+        vae = comfy.sd.VAE(device, sd=sd)
 
     return (unet, clip, vae)

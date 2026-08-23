@@ -141,6 +141,7 @@ class CausalWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
                  model_type='t2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -157,7 +158,6 @@ class CausalWanModel(WanModel):
                  cross_attn_norm=True,
                  eps=1e-6,
                  image_model=None,
-                 device=None,
                  dtype=None,
                  operations=None):
         super().__init__(
