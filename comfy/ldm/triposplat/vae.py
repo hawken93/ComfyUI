@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 import comfy.model_management
 import comfy.ops
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from .gaussian import build_gaussian_models
 from .model import MultiHeadRMSNorm, MLP, PcdAbsolutePositionEmbedder, attention
 
@@ -64,8 +65,8 @@ def sample_probs(probs, counts, generator=None):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, channels, num_heads, ctx_channels=None, type="self", qkv_bias=True, qk_rms_norm=False,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, channels, num_heads, ctx_channels=None, type="self", qkv_bias=True, qk_rms_norm=False,
+                 dtype=None):
         super().__init__()
         assert channels % num_heads == 0
         self.channels = channels
@@ -74,14 +75,15 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self._type = type
         self.qk_rms_norm = qk_rms_norm
+        self.optimized_attention = optimized_attention_for_device(device)
         if self._type == "self":
             self.to_qkv = operations.Linear(channels, channels * 3, bias=qkv_bias, dtype=dtype, device=device)
         else:
             self.to_q = operations.Linear(channels, channels, bias=qkv_bias, dtype=dtype, device=device)
             self.to_kv = operations.Linear(self.ctx_channels, channels * 2, bias=qkv_bias, dtype=dtype, device=device)
         if self.qk_rms_norm:
-            self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads, dtype=dtype, device=device)
-            self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads, dtype=dtype, device=device)
+            self.q_rms_norm = MultiHeadRMSNorm(device, self.head_dim, num_heads, dtype=dtype)
+            self.k_rms_norm = MultiHeadRMSNorm(device, self.head_dim, num_heads, dtype=dtype)
         self.to_out = operations.Linear(channels, channels, dtype=dtype, device=device)
 
     def forward(self, x, context=None):
@@ -95,15 +97,15 @@ class MultiHeadAttention(nn.Module):
         if self.qk_rms_norm:
             q = self.q_rms_norm(q)
             k = self.k_rms_norm(k)
-        h = attention(q, k, v)
+        h = attention(self.optimized_attention, q, k, v)
         return self.to_out(h.reshape(B, L, -1))
 
 
 # Octree probability decoder
 
 class LevelEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256, max_period=1024,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, frequency_embedding_size=256, max_period=1024,
+                 dtype=None):
         super().__init__()
         self.mlp = nn.Sequential(
             operations.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype, device=device),
@@ -129,16 +131,16 @@ class LevelEmbedder(nn.Module):
 
 
 class ModulatedTransformerCrossOnlyBlock(nn.Module):
-    def __init__(self, channels, ctx_channels, num_heads, mlp_ratio=4.0, share_mod=False,
-                 qk_rms_norm_cross=True, qkv_bias=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, channels, ctx_channels, num_heads, mlp_ratio=4.0, share_mod=False,
+                 qk_rms_norm_cross=True, qkv_bias=True, dtype=None):
         super().__init__()
         self.share_mod = share_mod
         self.norm1 = operations.LayerNorm(channels, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.norm2 = operations.LayerNorm(channels, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.cross_attn = MultiHeadAttention(channels, ctx_channels=ctx_channels, num_heads=num_heads,
+        self.cross_attn = MultiHeadAttention(device, operations, channels, ctx_channels=ctx_channels, num_heads=num_heads,
                                              type="cross", qkv_bias=qkv_bias,
-                                             qk_rms_norm=qk_rms_norm_cross, dtype=dtype, device=device, operations=operations)
-        self.mlp = MLP(channels, int(channels * mlp_ratio), channels, dtype=dtype, device=device, operations=operations)
+                                             qk_rms_norm=qk_rms_norm_cross, dtype=dtype)
+        self.mlp = MLP(device, operations, channels, int(channels * mlp_ratio), channels, dtype=dtype)
         if not share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(), operations.Linear(channels, 6 * channels, bias=True, dtype=dtype, device=device))
@@ -157,9 +159,9 @@ class ModulatedTransformerCrossOnlyBlock(nn.Module):
 
 class OctreeProbabilityFixedlenDecoder(nn.Module):
     # Cross-attention transformer over octree coords -> per-node 8-way child occupancy logits.
-    def __init__(self, model_channels=1024, cond_channels=16, num_blocks=4, num_heads=16,
+    def __init__(self, device, operations, model_channels=1024, cond_channels=16, num_blocks=4, num_heads=16,
                  num_head_channels=64, mlp_ratio=4.0, share_mod=True,
-                 qk_rms_norm_cross=True, dtype=None, device=None, operations=None):
+                 qk_rms_norm_cross=True, dtype=None):
         super().__init__()
         self.model_channels = model_channels
         self.cond_channels = cond_channels
@@ -169,16 +171,16 @@ class OctreeProbabilityFixedlenDecoder(nn.Module):
         self.share_mod = share_mod
         self.qk_rms_norm_cross = qk_rms_norm_cross
         self.input_layer = operations.Linear(model_channels, model_channels, dtype=dtype, device=device)
-        self.l_embedder = LevelEmbedder(model_channels, dtype=dtype, device=device, operations=operations)
+        self.l_embedder = LevelEmbedder(device, operations, model_channels, dtype=dtype)
         if share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(), operations.Linear(model_channels, 6 * model_channels, bias=True, dtype=dtype, device=device))
         if cond_channels is not None:
             self.blocks = nn.ModuleList([
                 ModulatedTransformerCrossOnlyBlock(
-                    model_channels, ctx_channels=cond_channels, num_heads=self.num_heads,
+                    device, operations, model_channels, ctx_channels=cond_channels, num_heads=self.num_heads,
                     mlp_ratio=self.mlp_ratio, qk_rms_norm_cross=self.qk_rms_norm_cross,
-                    share_mod=self.share_mod, dtype=dtype, device=device, operations=operations)
+                    share_mod=self.share_mod, dtype=dtype)
                 for _ in range(num_blocks)
             ])
         self.out_proj = operations.Linear(model_channels, 8, dtype=dtype, device=device)
@@ -249,18 +251,18 @@ class OctreeProbabilityFixedlenDecoder(nn.Module):
 # Elastic gaussian decoder
 
 class TransformerCrossBlock(nn.Module):
-    def __init__(self, channels, ctx_channels, num_heads, mlp_ratio=4.0,
+    def __init__(self, device, operations, channels, ctx_channels, num_heads, mlp_ratio=4.0,
                  qk_rms_norm=True, qk_rms_norm_cross=True, qkv_bias=True,
-                 dtype=None, device=None, operations=None):
+                 dtype=None):
         super().__init__()
         self.norm1 = operations.LayerNorm(channels, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.norm2 = operations.LayerNorm(channels, elementwise_affine=True, eps=1e-6, dtype=dtype, device=device)
         self.norm3 = operations.LayerNorm(channels, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.self_attn = MultiHeadAttention(channels, num_heads=num_heads, type="self", qkv_bias=qkv_bias,
-                                            qk_rms_norm=qk_rms_norm, dtype=dtype, device=device, operations=operations)
-        self.cross_attn = MultiHeadAttention(channels, ctx_channels=ctx_channels, num_heads=num_heads, type="cross",
-                                             qkv_bias=qkv_bias, qk_rms_norm=qk_rms_norm_cross, dtype=dtype, device=device, operations=operations)
-        self.mlp = MLP(channels, int(channels * mlp_ratio), channels, dtype=dtype, device=device, operations=operations)
+        self.self_attn = MultiHeadAttention(device, operations, channels, num_heads=num_heads, type="self", qkv_bias=qkv_bias,
+                                            qk_rms_norm=qk_rms_norm, dtype=dtype)
+        self.cross_attn = MultiHeadAttention(device, operations, channels, ctx_channels=ctx_channels, num_heads=num_heads, type="cross",
+                                             qkv_bias=qkv_bias, qk_rms_norm=qk_rms_norm_cross, dtype=dtype)
+        self.mlp = MLP(device, operations, channels, int(channels * mlp_ratio), channels, dtype=dtype)
 
     def forward(self, x, context):
         x = x + self.self_attn(self.norm1(x))
@@ -271,9 +273,9 @@ class TransformerCrossBlock(nn.Module):
 
 class ElasticGaussianFixedlenDecoder(nn.Module):
     # Cross-attention transformer over sampled octree points -> per-point gaussian params.
-    def __init__(self, in_channels=3, model_channels=1024, cond_channels=16, num_blocks=16, num_heads=16,
-                 num_head_channels=64, mlp_ratio=4.0, *, representation_config=None,
-                 qk_rms_norm=True, qk_rms_norm_cross=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels=3, model_channels=1024, cond_channels=16, num_blocks=16, num_heads=16,
+                 num_head_channels=64, mlp_ratio=4.0, representation_config=None,
+                 qk_rms_norm=True, qk_rms_norm_cross=True, dtype=None):
         super().__init__()
         self.rep_config = representation_config or dict(
             lr=dict(_xyz=1.0, _features_dc=1.0, _opacity=1.0, _scaling=1.0, _rotation=0.1),
@@ -290,10 +292,10 @@ class ElasticGaussianFixedlenDecoder(nn.Module):
         self.input_layer = operations.Linear(model_channels, model_channels, dtype=dtype, device=device)
         if cond_channels is not None:
             self.blocks = nn.ModuleList([
-                TransformerCrossBlock(model_channels, ctx_channels=cond_channels,
+                TransformerCrossBlock(device, operations, model_channels, ctx_channels=cond_channels,
                                       num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
                                       qk_rms_norm=qk_rms_norm, qk_rms_norm_cross=qk_rms_norm_cross,
-                                      dtype=dtype, device=device, operations=operations)
+                                      dtype=dtype)
                 for _ in range(num_blocks)
             ])
         self.in_proj = operations.Linear(in_channels, model_channels, dtype=dtype, device=device)
@@ -359,12 +361,12 @@ class ElasticGaussianFixedlenDecoder(nn.Module):
 class OctreeGaussianDecoder(nn.Module):
     _MAX_VOXEL_LEVEL = 8
 
-    def __init__(self, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations=None, dtype=None):
         super().__init__()
         if operations is None:
             operations = comfy.ops.disable_weight_init
-        self.octree = OctreeProbabilityFixedlenDecoder(dtype=dtype, device=device, operations=operations)
-        self.gs = ElasticGaussianFixedlenDecoder(dtype=dtype, device=device, operations=operations)
+        self.octree = OctreeProbabilityFixedlenDecoder(device, operations, dtype=dtype)
+        self.gs = ElasticGaussianFixedlenDecoder(device, operations, dtype=dtype)
 
     @property
     def gaussians_per_point(self) -> int:

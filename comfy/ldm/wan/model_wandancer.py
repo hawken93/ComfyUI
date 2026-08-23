@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import comfy
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.flux.layers import EmbedND
 
@@ -9,12 +9,13 @@ from .model import AudioInjector_WAN, WanModel, MLPProj, Head, sinusoidal_embedd
 
 
 class MusicSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, dim, num_heads, dtype=None):
         assert dim % num_heads == 0
         super().__init__()
         self.embed_dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.optimized_attention = optimized_attention_for_device(device)
 
         self.q_proj = operations.Linear(dim, dim, device=device, dtype=dtype)
         self.k_proj = operations.Linear(dim, dim, device=device, dtype=dtype)
@@ -30,7 +31,7 @@ class MusicSelfAttention(nn.Module):
         k = self.k_proj(x).view(b, s, n, d)
         k = apply_rope1(k, freqs)
 
-        x = optimized_attention(
+        x = self.optimized_attention(
             q.view(b, s, n * d),
             k.view(b, s, n * d),
             self.v_proj(x).view(b, s, n * d),
@@ -41,9 +42,9 @@ class MusicSelfAttention(nn.Module):
 
 
 class MusicEncoderLayer(nn.Module):
-    def __init__(self, dim: int, num_heads: int, ffn_dim: int, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, dim: int, num_heads: int, ffn_dim: int, dtype=None):
         super().__init__()
-        self.self_attn = MusicSelfAttention(dim, num_heads, device=device, dtype=dtype, operations=operations)
+        self.self_attn = MusicSelfAttention(device, operations, dim, num_heads, dtype=dtype)
 
         self.linear1 = operations.Linear(dim, ffn_dim, device=device, dtype=dtype)
         self.linear2 = operations.Linear(ffn_dim, dim, device=device, dtype=dtype)
@@ -60,6 +61,7 @@ class MusicEncoderLayer(nn.Module):
 class WanDancerModel(WanModel):
     def __init__(self,
                  device,
+                 operations,
                  model_type='wandancer',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -77,36 +79,36 @@ class WanDancerModel(WanModel):
                  eps=1e-6,
                  in_dim_ref_conv=None,
                  image_model=None,
-                 dtype=None, operations=None,
                  audio_inject_layers=[0, 4, 8, 12, 16, 20, 24, 27],
                  music_dim = 256,
                  music_heads = 4,
                  music_feature_dim = 35,
-                 music_latent_dim = 256
+                 music_latent_dim = 256,
+                 dtype=None
                  ):
 
-        super().__init__(model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim,
+        super().__init__(device, operations, model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim,
                          num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, image_model=image_model, in_dim_ref_conv=in_dim_ref_conv,
-                         device=device, dtype=dtype, operations=operations)
+                         dtype=dtype)
 
         self.dtype = dtype
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
 
-        self.patch_embedding_global = operations.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size, device=operation_settings.get("device"), dtype=torch.float32)
-        self.img_emb_refimage = MLPProj(1280, dim, operation_settings=operation_settings)
-        self.head_global = Head(dim, out_dim, patch_size, eps, operation_settings=operation_settings)
+        self.patch_embedding_global = operations.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)
+        self.img_emb_refimage = MLPProj(device, operations, 1280, dim, dtype=dtype)
+        self.head_global = Head(device, operations, dim, out_dim, patch_size, eps, dtype=dtype)
 
         self.music_injector = AudioInjector_WAN(
+            device, operations,
             dim=self.dim,
             num_heads=self.num_heads,
             inject_layer=audio_inject_layers,
             root_net=self,
             enable_adain=False,
-            dtype=dtype, device=device, operations=operations
+            dtype=dtype
         )
 
         self.music_projection = operations.Linear(music_feature_dim, music_latent_dim, device=device, dtype=dtype)
-        self.music_encoder = nn.ModuleList([MusicEncoderLayer(dim=music_dim, num_heads=music_heads, ffn_dim=1024, device=device, dtype=dtype, operations=operations) for _ in range(2)])
+        self.music_encoder = nn.ModuleList([MusicEncoderLayer(device, operations, music_dim, music_heads, 1024, dtype=dtype) for _ in range(2)])
         music_head_dim = music_dim // music_heads
         self.music_rope_embedder = EmbedND(dim=music_head_dim, theta=10000.0, axes_dim=[music_head_dim])
 

@@ -10,10 +10,12 @@ from .model import WanFeedForward, WanSelfAttention
 class Uni3CLayerNormZero(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         conditioning_dim,
         embedding_dim,
         eps=1e-5,
-        device=None, dtype=None, operations=None
+        dtype=None
     ):
         super().__init__()
         self.silu = nn.SiLU()
@@ -29,18 +31,19 @@ class Uni3CLayerNormZero(nn.Module):
 class Uni3CAttentionBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim,
         ffn_dim,
         num_heads,
         time_embed_dim=5120,
         eps=1e-6,
-        device=None, dtype=None, operations=None
+        dtype=None
     ):
         super().__init__()
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
-        self.norm1 = Uni3CLayerNormZero(time_embed_dim, dim, device=device, dtype=dtype, operations=operations)
-        self.self_attn = WanSelfAttention(dim, num_heads, qk_norm=True, eps=eps, operation_settings=operation_settings)
-        self.norm2 = Uni3CLayerNormZero(time_embed_dim, dim, device=device, dtype=dtype, operations=operations)
+        self.norm1 = Uni3CLayerNormZero(device, operations, time_embed_dim, dim, dtype=dtype)
+        self.self_attn = WanSelfAttention(device, operations, dim, num_heads, qk_norm=True, eps=eps, dtype=dtype)
+        self.norm2 = Uni3CLayerNormZero(device, operations, time_embed_dim, dim, dtype=dtype)
         self.ffn = WanFeedForward(
             operations.Linear(dim, ffn_dim, device=device, dtype=dtype), nn.GELU(approximate='tanh'),
             operations.Linear(ffn_dim, dim, device=device, dtype=dtype))
@@ -56,10 +59,12 @@ class Uni3CAttentionBlock(nn.Module):
 class MaskCamEmbed(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         add_channels=7,
         mid_channels=256,
         conv_out_dim=5120,
-        device=None, dtype=None, operations=None
+        dtype=None
     ):
         super().__init__()
         self.mask_padding = [0, 0, 0, 0, 3, 0]  # first frame conditioning
@@ -80,6 +85,8 @@ class MaskCamEmbed(nn.Module):
 class WanUni3CControlnet(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         in_channels=36,
         conv_out_dim=5120,
         dim=1024,
@@ -90,7 +97,7 @@ class WanUni3CControlnet(nn.Module):
         out_proj_dim=5120,
         add_channels=7,
         mid_channels=256,
-        device=None, dtype=None, operations=None
+        dtype=None
     ):
         super().__init__()
         patch_size = (1, 2, 2)
@@ -98,7 +105,7 @@ class WanUni3CControlnet(nn.Module):
 
         self.controlnet_patch_embedding = operations.Conv3d(
             in_channels, conv_out_dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)
-        self.controlnet_mask_embedding = MaskCamEmbed(add_channels, mid_channels, conv_out_dim, device=device, dtype=dtype, operations=operations)
+        self.controlnet_mask_embedding = MaskCamEmbed(device, operations, add_channels, mid_channels, conv_out_dim, dtype=dtype)
 
         if conv_out_dim != dim:
             self.proj_in = operations.Linear(conv_out_dim, dim, device=device, dtype=dtype)
@@ -106,7 +113,7 @@ class WanUni3CControlnet(nn.Module):
             self.proj_in = nn.Identity()
 
         self.controlnet_blocks = nn.ModuleList([
-            Uni3CAttentionBlock(dim, ffn_dim, num_heads, time_embed_dim, device=device, dtype=dtype, operations=operations)
+            Uni3CAttentionBlock(device, operations, dim, ffn_dim, num_heads, time_embed_dim, dtype=dtype)
             for _ in range(num_layers)])
         self.proj_out = nn.ModuleList([
             operations.Linear(dim, out_proj_dim, device=device, dtype=dtype)

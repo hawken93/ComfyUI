@@ -9,12 +9,12 @@ import torch.nn.functional as F
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.rmsnorm
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.math import apply_rope
 
 
 class MultiHeadRMSNorm(nn.Module):
-    def __init__(self, dim, heads, dtype=None, device=None):
+    def __init__(self, device, dim, heads, dtype=None):
         super().__init__()
         self.gamma = nn.Parameter(torch.empty(heads, dim, dtype=dtype, device=device))
 
@@ -26,8 +26,8 @@ class MultiHeadRMSNorm(nn.Module):
 # Positional embeddings
 
 class RePo3DRotaryEmbedding(nn.Module):
-    def __init__(self, model_channels, num_heads, head_dim, repo_hidden_ratio=0.125, max_freq=16.0,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, model_channels, num_heads, head_dim, repo_hidden_ratio=0.125, max_freq=16.0,
+                 dtype=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -100,7 +100,7 @@ class PcdAbsolutePositionEmbedder(nn.Module):
         return out.to(orig_dtype)
 
 
-def attention(q, k, v, transformer_options=None):
+def attention(optimized_attention, q, k, v, transformer_options=None):
     # q, k, v: (B, L, heads, dim) -> (B, L, heads, dim). Shared optimized_attention call convention.
     out = optimized_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), heads=q.shape[2],
                               skip_reshape=True, skip_output_reshape=True, low_precision_attention=False,
@@ -111,7 +111,7 @@ def attention(q, k, v, transformer_options=None):
 # Transformer building blocks
 
 class MLP(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels, hidden_channels, out_channels, dtype=None):
         super().__init__()
         self.mlp = nn.Sequential(
             operations.Linear(in_channels, hidden_channels, dtype=dtype, device=device),
@@ -124,18 +124,19 @@ class MLP(nn.Module):
 
 
 class RopeMultiHeadAttention(nn.Module):
-    def __init__(self, channels, num_heads, qkv_bias=True, qk_rms_norm=False, use_rope=False,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, channels, num_heads, qkv_bias=True, qk_rms_norm=False, use_rope=False,
+                 dtype=None):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.qk_rms_norm = qk_rms_norm
         self.use_rope = use_rope
+        self.optimized_attention = optimized_attention_for_device(device)
         self.qkv = operations.Linear(channels, channels * 3, bias=qkv_bias, dtype=dtype, device=device)
         if self.qk_rms_norm:
-            self.q_norm = MultiHeadRMSNorm(self.head_dim, num_heads, dtype=dtype, device=device)
-            self.k_norm = MultiHeadRMSNorm(self.head_dim, num_heads, dtype=dtype, device=device)
+            self.q_norm = MultiHeadRMSNorm(device, self.head_dim, num_heads, dtype=dtype)
+            self.k_norm = MultiHeadRMSNorm(device, self.head_dim, num_heads, dtype=dtype)
         self.out = operations.Linear(channels, channels, dtype=dtype, device=device)
 
     def forward(self, x, rope_emb=None, transformer_options=None):
@@ -147,24 +148,24 @@ class RopeMultiHeadAttention(nn.Module):
         if self.qk_rms_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        h = attention(q, k, v, transformer_options)  # (B, L, heads, dim)
+        h = attention(self.optimized_attention, q, k, v, transformer_options)  # (B, L, heads, dim)
         return self.out(h.reshape(B, L, C))
 
 
 class UnifiedTransformerBlock(nn.Module):
-    def __init__(self, channels, num_heads, mlp_ratio=4.0,
+    def __init__(self, device, operations, channels, num_heads, mlp_ratio=4.0,
                  use_rope=False, qk_rms_norm=False, qkv_bias=True,
                  modulation=True, share_mod=False,
-                 dtype=None, device=None, operations=None):
+                 dtype=None):
         super().__init__()
         self.modulation = modulation
         self.share_mod = share_mod
         self.norm1 = operations.LayerNorm(channels, elementwise_affine=not modulation, eps=1e-6, dtype=dtype, device=device)
         self.norm2 = operations.LayerNorm(channels, elementwise_affine=not modulation, eps=1e-6, dtype=dtype, device=device)
-        self.attn = RopeMultiHeadAttention(channels, num_heads=num_heads,
+        self.attn = RopeMultiHeadAttention(device, operations, channels, num_heads=num_heads,
                                            qkv_bias=qkv_bias, use_rope=use_rope, qk_rms_norm=qk_rms_norm,
-                                           dtype=dtype, device=device, operations=operations)
-        self.mlp = MLP(channels, int(channels * mlp_ratio), channels, dtype=dtype, device=device, operations=operations)
+                                           dtype=dtype)
+        self.mlp = MLP(device, operations, channels, int(channels * mlp_ratio), channels, dtype=dtype)
         if modulation:
             if not share_mod:
                 self.adaLN_modulation = nn.Sequential(
@@ -188,7 +189,7 @@ class UnifiedTransformerBlock(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, frequency_embedding_size=256, dtype=None):
         super().__init__()
         self.mlp = nn.Sequential(
             operations.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype, device=device),
@@ -213,13 +214,13 @@ class TimestepEmbedder(nn.Module):
 
 
 class LatentSeqMMFlowModel(nn.Module):
-    def __init__(self, device, image_model=None, q_token_length=8192, in_channels=16, model_channels=1024,
+    def __init__(self, device, operations, image_model=None, q_token_length=8192, in_channels=16, model_channels=1024,
                  cond_channels=1280, out_channels=16, num_blocks=24, num_refiner_blocks=2,
                  num_heads=None, num_head_channels=64, cam_channels=5, cond2_channels=128,
-                 mlp_ratio=4, share_mod=True, qk_rms_norm=True,
-                 dtype=None, operations=None, **kwargs):
+                 mlp_ratio=4, share_mod=True, qk_rms_norm=True, dtype=None):
         super().__init__()
         self.dtype = dtype
+        self.device = device
         self.q_token_length = q_token_length
         self.in_channels = in_channels
         self.cam_channels = cam_channels
@@ -234,16 +235,13 @@ class LatentSeqMMFlowModel(nn.Module):
         self.share_mod = share_mod
         self.qk_rms_norm = qk_rms_norm
 
-        factory_kwargs = dict(dtype=dtype, device=device)
-        op_kwargs = dict(operations=operations, **factory_kwargs)
-
-        self.t_embedder = TimestepEmbedder(model_channels, **op_kwargs)
+        self.t_embedder = TimestepEmbedder(device, operations, model_channels, dtype=dtype)
         if share_mod:
-            self.adaLN_modulation = nn.Sequential(nn.SiLU(), operations.Linear(model_channels, 6 * model_channels, bias=True, **factory_kwargs))
+            self.adaLN_modulation = nn.Sequential(nn.SiLU(), operations.Linear(model_channels, 6 * model_channels, bias=True, dtype=dtype, device=device))
 
-        self.input_layer = operations.Linear(in_channels, model_channels, **factory_kwargs)
-        self.cond_embedder = operations.Linear(cond_channels, model_channels, **factory_kwargs)
-        self.cond_embedder2 = operations.Linear(cond2_channels, model_channels, **factory_kwargs) if cond2_channels is not None else None
+        self.input_layer = operations.Linear(in_channels, model_channels, dtype=dtype, device=device)
+        self.cond_embedder = operations.Linear(cond_channels, model_channels, dtype=dtype, device=device)
+        self.cond_embedder2 = operations.Linear(cond2_channels, model_channels, dtype=dtype, device=device) if cond2_channels is not None else None
 
         # Fixed Sobol (low-discrepancy) 3D anchor positions for the latent tokens, used as positional encoding.
         # The embedder is parameter-free and the anchors are fixed, precompute once.
@@ -252,29 +250,30 @@ class LatentSeqMMFlowModel(nn.Module):
         self.register_buffer("pos_emb", pos_emb, persistent=False)
 
         # RePo3DRotaryEmbedding layers for the refiner and main blocks
-        repo_kwargs = dict(num_heads=self.num_heads, head_dim=num_head_channels, **op_kwargs)
         self.noise_repo_layers = nn.ModuleList(
-            [RePo3DRotaryEmbedding(model_channels, **repo_kwargs) for _ in range(num_refiner_blocks)])
+            [RePo3DRotaryEmbedding(device, operations, model_channels, num_heads=self.num_heads, head_dim=num_head_channels, dtype=dtype) for _ in range(num_refiner_blocks)])
         self.context_repo_layers = nn.ModuleList(
-            [RePo3DRotaryEmbedding(model_channels, **repo_kwargs) for _ in range(num_refiner_blocks)])
+            [RePo3DRotaryEmbedding(device, operations, model_channels, num_heads=self.num_heads, head_dim=num_head_channels, dtype=dtype) for _ in range(num_refiner_blocks)])
         self.repo_layers = nn.ModuleList(
-            [RePo3DRotaryEmbedding(model_channels, **repo_kwargs) for _ in range(num_blocks)])
+            [RePo3DRotaryEmbedding(device, operations, model_channels, num_heads=self.num_heads, head_dim=num_head_channels, dtype=dtype) for _ in range(num_blocks)])
 
         # Refiner blocks
-        block_kwargs = dict(num_heads=self.num_heads, mlp_ratio=self.mlp_ratio, use_rope=True, qk_rms_norm=self.qk_rms_norm, **op_kwargs)
         self.noise_refiner = nn.ModuleList(
-            [UnifiedTransformerBlock(model_channels, modulation=True, share_mod=self.share_mod, **block_kwargs) for _ in range(num_refiner_blocks)])
+            [UnifiedTransformerBlock(device, operations, model_channels, num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
+                                     use_rope=True, qk_rms_norm=self.qk_rms_norm, modulation=True, share_mod=self.share_mod, dtype=dtype) for _ in range(num_refiner_blocks)])
         self.context_refiner = nn.ModuleList(
-            [UnifiedTransformerBlock(model_channels, modulation=False, **block_kwargs) for _ in range(num_refiner_blocks)])
+            [UnifiedTransformerBlock(device, operations, model_channels, num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
+                                     use_rope=True, qk_rms_norm=self.qk_rms_norm, modulation=False, share_mod=self.share_mod, dtype=dtype) for _ in range(num_refiner_blocks)])
 
-        self.cam_refiner = MLP(self.cam_channels, model_channels, model_channels, **op_kwargs)
+        self.cam_refiner = MLP(device, operations, self.cam_channels, model_channels, model_channels, dtype=dtype)
 
         self.blocks = nn.ModuleList(
-            [UnifiedTransformerBlock(model_channels, modulation=True, share_mod=self.share_mod, **block_kwargs) for _ in range(num_blocks)])
+            [UnifiedTransformerBlock(device, operations, model_channels, num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
+                                     use_rope=True, qk_rms_norm=self.qk_rms_norm, modulation=True, share_mod=self.share_mod, dtype=dtype) for _ in range(num_blocks)])
 
-        self.shift_table = nn.Parameter(torch.empty(1, 2, model_channels, **factory_kwargs))
-        self.out_layer = operations.Linear(model_channels, out_channels, **factory_kwargs)
-        self.cam_out_layer = operations.Linear(model_channels, cam_channels, **factory_kwargs)
+        self.shift_table = nn.Parameter(torch.empty(1, 2, model_channels, dtype=dtype, device=device))
+        self.out_layer = operations.Linear(model_channels, out_channels, dtype=dtype, device=device)
+        self.cam_out_layer = operations.Linear(model_channels, cam_channels, dtype=dtype, device=device)
 
     def forward(self, x, t, context=None, ref_latents=None, transformer_options={}, **kwargs):
         return comfy.patcher_extension.WrapperExecutor.new_class_executor(

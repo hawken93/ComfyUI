@@ -811,7 +811,7 @@ class MultiTalkModelPatch(torch.nn.Module):
         )
         self.blocks = torch.nn.ModuleList(
             [
-                WanMultiTalkAttentionBlock(in_dim, out_dim, device=device, dtype=dtype, operations=operations)
+                WanMultiTalkAttentionBlock(device, operations, in_dim, out_dim, dtype=dtype)
                 for _ in range(num_layers)
             ]
         )

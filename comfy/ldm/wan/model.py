@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.flux.math import apply_rope1, rope
 import comfy.ldm.common_dit
@@ -31,13 +31,15 @@ def sinusoidal_embedding_1d(dim, position):
 class WanSelfAttention(nn.Module):
 
     def __init__(self,
+                 device,
+                 operations,
                  dim,
                  num_heads,
                  window_size=(-1, -1),
                  qk_norm=True,
                  eps=1e-6,
                  kv_dim=None,
-                 operation_settings={}):
+                 dtype=None):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -46,16 +48,17 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.optimized_attention = optimized_attention_for_device(device)
         if kv_dim is None:
             kv_dim = dim
 
         # layers
-        self.q = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.k = operation_settings.get("operations").Linear(kv_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.v = operation_settings.get("operations").Linear(kv_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.o = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.norm_q = operation_settings.get("operations").RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
-        self.norm_k = operation_settings.get("operations").RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
+        self.q = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.k = operations.Linear(kv_dim, dim, device=device, dtype=dtype)
+        self.v = operations.Linear(kv_dim, dim, device=device, dtype=dtype)
+        self.o = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.norm_q = operations.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
+        self.norm_k = operations.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
 
     def forward(self, x, freqs, transformer_options={}):
         r"""
@@ -81,7 +84,7 @@ class WanSelfAttention(nn.Module):
         q = qkv_fn_q(x)
         k = qkv_fn_k(x)
 
-        x = optimized_attention(
+        x = self.optimized_attention(
             q.view(b, s, n * d),
             k.view(b, s, n * d),
             self.v(x).view(b, s, n * d),
@@ -111,7 +114,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         v = self.v(context)
 
         # compute attention
-        x = optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
+        x = self.optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
 
         x = self.o(x)
         return x
@@ -120,17 +123,20 @@ class WanT2VCrossAttention(WanSelfAttention):
 class WanI2VCrossAttention(WanSelfAttention):
 
     def __init__(self,
+                 device,
+                 operations,
                  dim,
                  num_heads,
                  window_size=(-1, -1),
                  qk_norm=True,
-                 eps=1e-6, operation_settings={}):
-        super().__init__(dim, num_heads, window_size, qk_norm, eps, operation_settings=operation_settings)
+                 eps=1e-6,
+                 dtype=None):
+        super().__init__(device, operations, dim, num_heads, window_size, qk_norm, eps, dtype=dtype)
 
-        self.k_img = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.v_img = operation_settings.get("operations").Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.k_img = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.v_img = operations.Linear(dim, dim, device=device, dtype=dtype)
         # self.alpha = nn.Parameter(torch.zeros((1, )))
-        self.norm_k_img = operation_settings.get("operations").RMSNorm(dim, eps=eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if qk_norm else nn.Identity()
+        self.norm_k_img = operations.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_img_len, transformer_options={}):
         r"""
@@ -148,9 +154,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         k_img = self.norm_k_img(self.k_img(context_img))
         v_img = self.v_img(context_img)
         # Sageattn can cause Nans here, don't allow it as there is no speed difference anyway as img attention is tiny.
-        img_x = optimized_attention(q, k_img, v_img, heads=self.num_heads, transformer_options=transformer_options, low_precision_attention=False)
+        img_x = self.optimized_attention(q, k_img, v_img, heads=self.num_heads, transformer_options=transformer_options, low_precision_attention=False)
         # compute attention
-        x = optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
+        x = self.optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
 
         # output
         x = x + img_x
@@ -186,6 +192,8 @@ class WanFeedForward(nn.Sequential):
 class WanAttentionBlock(nn.Module):
 
     def __init__(self,
+                 device,
+                 operations,
                  cross_attn_type,
                  dim,
                  ffn_dim,
@@ -193,7 +201,8 @@ class WanAttentionBlock(nn.Module):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6, operation_settings={}):
+                 eps=1e-6,
+                 dtype=None):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -204,24 +213,26 @@ class WanAttentionBlock(nn.Module):
         self.eps = eps
 
         # layers
-        self.norm1 = operation_settings.get("operations").LayerNorm(dim, eps, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
-                                          eps, operation_settings=operation_settings)
-        self.norm3 = operation_settings.get("operations").LayerNorm(
+        self.norm1 = operations.LayerNorm(dim, eps, elementwise_affine=False, device=device, dtype=dtype)
+        self.self_attn = WanSelfAttention(device, operations, dim, num_heads,
+                                          window_size, qk_norm, eps, dtype=dtype)
+        self.norm3 = operations.LayerNorm(
             dim, eps,
-            elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
+            elementwise_affine=True, device=device, dtype=dtype) if cross_attn_norm else nn.Identity()
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](device,
+                                                                      operations,
+                                                                      dim,
                                                                       num_heads,
                                                                       (-1, -1),
                                                                       qk_norm,
-                                                                      eps, operation_settings=operation_settings)
-        self.norm2 = operation_settings.get("operations").LayerNorm(dim, eps, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+                                                                      eps, dtype=dtype)
+        self.norm2 = operations.LayerNorm(dim, eps, elementwise_affine=False, device=device, dtype=dtype)
         self.ffn = WanFeedForward(
-            operation_settings.get("operations").Linear(dim, ffn_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.GELU(approximate='tanh'),
-            operation_settings.get("operations").Linear(ffn_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+            operations.Linear(dim, ffn_dim, device=device, dtype=dtype), nn.GELU(approximate='tanh'),
+            operations.Linear(ffn_dim, dim, device=device, dtype=dtype))
 
         # modulation
-        self.modulation = nn.Parameter(torch.empty(1, 6, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+        self.modulation = nn.Parameter(torch.empty(1, 6, dim, device=device, dtype=dtype))
 
     def forward(
         self,
@@ -272,6 +283,8 @@ class WanAttentionBlock(nn.Module):
 class VaceWanAttentionBlock(WanAttentionBlock):
     def __init__(
             self,
+            device,
+            operations,
             cross_attn_type,
             dim,
             ffn_dim,
@@ -281,13 +294,13 @@ class VaceWanAttentionBlock(WanAttentionBlock):
             cross_attn_norm=False,
             eps=1e-6,
             block_id=0,
-            operation_settings={}
+            dtype=None
     ):
-        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, operation_settings=operation_settings)
+        super().__init__(device, operations, cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, dtype=dtype)
         self.block_id = block_id
         if block_id == 0:
-            self.before_proj = operation_settings.get("operations").Linear(self.dim, self.dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.after_proj = operation_settings.get("operations").Linear(self.dim, self.dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+            self.before_proj = operations.Linear(self.dim, self.dim, device=device, dtype=dtype)
+        self.after_proj = operations.Linear(self.dim, self.dim, device=device, dtype=dtype)
 
     def forward(self, c, x, **kwargs):
         if self.block_id == 0:
@@ -298,7 +311,7 @@ class VaceWanAttentionBlock(WanAttentionBlock):
 
 
 class WanCamAdapter(nn.Module):
-    def __init__(self, in_dim, out_dim, kernel_size, stride, num_residual_blocks=1, operation_settings={}):
+    def __init__(self, device, operations, in_dim, out_dim, kernel_size, stride, num_residual_blocks=1, dtype=None):
         super(WanCamAdapter, self).__init__()
 
         # Pixel Unshuffle: reduce spatial dimensions by a factor of 8
@@ -306,11 +319,11 @@ class WanCamAdapter(nn.Module):
 
         # Convolution: reduce spatial dimensions by a factor
         #  of 2 (without overlap)
-        self.conv = operation_settings.get("operations").Conv2d(in_dim * 64, out_dim, kernel_size=kernel_size, stride=stride, padding=0, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.conv = operations.Conv2d(in_dim * 64, out_dim, kernel_size=kernel_size, stride=stride, padding=0, device=device, dtype=dtype)
 
         # Residual blocks for feature extraction
         self.residual_blocks = nn.Sequential(
-            *[WanCamResidualBlock(out_dim, operation_settings = operation_settings) for _ in range(num_residual_blocks)]
+            *[WanCamResidualBlock(device, operations, out_dim, dtype=dtype) for _ in range(num_residual_blocks)]
         )
 
     def forward(self, x):
@@ -337,11 +350,11 @@ class WanCamAdapter(nn.Module):
 
 
 class WanCamResidualBlock(nn.Module):
-    def __init__(self, dim, operation_settings={}):
+    def __init__(self, device, operations, dim, dtype=None):
         super(WanCamResidualBlock, self).__init__()
-        self.conv1 = operation_settings.get("operations").Conv2d(dim, dim, kernel_size=3, padding=1, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.conv1 = operations.Conv2d(dim, dim, kernel_size=3, padding=1, device=device, dtype=dtype)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = operation_settings.get("operations").Conv2d(dim, dim, kernel_size=3, padding=1, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.conv2 = operations.Conv2d(dim, dim, kernel_size=3, padding=1, device=device, dtype=dtype)
 
     def forward(self, x):
         residual = x
@@ -353,7 +366,7 @@ class WanCamResidualBlock(nn.Module):
 
 class Head(nn.Module):
 
-    def __init__(self, dim, out_dim, patch_size, eps=1e-6, operation_settings={}):
+    def __init__(self, device, operations, dim, out_dim, patch_size, eps=1e-6, dtype=None):
         super().__init__()
         self.dim = dim
         self.out_dim = out_dim
@@ -362,11 +375,11 @@ class Head(nn.Module):
 
         # layers
         out_dim = math.prod(patch_size) * out_dim
-        self.norm = operation_settings.get("operations").LayerNorm(dim, eps, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.head = operation_settings.get("operations").Linear(dim, out_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.norm = operations.LayerNorm(dim, eps, elementwise_affine=False, device=device, dtype=dtype)
+        self.head = operations.Linear(dim, out_dim, device=device, dtype=dtype)
 
         # modulation
-        self.modulation = nn.Parameter(torch.empty(1, 2, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+        self.modulation = nn.Parameter(torch.empty(1, 2, dim, device=device, dtype=dtype))
 
     def forward(self, x, e):
         r"""
@@ -386,16 +399,16 @@ class Head(nn.Module):
 
 class MLPProj(torch.nn.Module):
 
-    def __init__(self, in_dim, out_dim, flf_pos_embed_token_number=None, operation_settings={}):
+    def __init__(self, device, operations, in_dim, out_dim, flf_pos_embed_token_number=None, dtype=None):
         super().__init__()
 
         self.proj = torch.nn.Sequential(
-            operation_settings.get("operations").LayerNorm(in_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), operation_settings.get("operations").Linear(in_dim, in_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")),
-            torch.nn.GELU(), operation_settings.get("operations").Linear(in_dim, out_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")),
-            operation_settings.get("operations").LayerNorm(out_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+            operations.LayerNorm(in_dim, device=device, dtype=dtype), operations.Linear(in_dim, in_dim, device=device, dtype=dtype),
+            torch.nn.GELU(), operations.Linear(in_dim, out_dim, device=device, dtype=dtype),
+            operations.LayerNorm(out_dim, device=device, dtype=dtype))
 
         if flf_pos_embed_token_number is not None:
-            self.emb_pos = nn.Parameter(torch.empty((1, flf_pos_embed_token_number, in_dim), device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+            self.emb_pos = nn.Parameter(torch.empty((1, flf_pos_embed_token_number, in_dim), device=device, dtype=dtype))
         else:
             self.emb_pos = None
 
@@ -414,6 +427,7 @@ class WanModel(torch.nn.Module):
 
     def __init__(self,
                  device,
+                 operations,
                  model_type='t2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -434,7 +448,6 @@ class WanModel(torch.nn.Module):
                  wan_attn_block_class=WanAttentionBlock,
                  image_model=None,
                  dtype=None,
-                 operations=None,
                  ):
         r"""
         Initialize the diffusion model backbone.
@@ -474,7 +487,6 @@ class WanModel(torch.nn.Module):
 
         super().__init__()
         self.dtype = dtype
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
 
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
@@ -496,36 +508,39 @@ class WanModel(torch.nn.Module):
 
         # embeddings
         self.patch_embedding = operations.Conv3d(
-            in_dim, dim, kernel_size=patch_size, stride=patch_size, device=operation_settings.get("device"), dtype=torch.float32)
+            in_dim, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)
         self.text_embedding = nn.Sequential(
-            operations.Linear(text_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.GELU(approximate='tanh'),
-            operations.Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+            operations.Linear(text_dim, dim, device=device, dtype=dtype), nn.GELU(approximate='tanh'),
+            operations.Linear(dim, dim, device=device, dtype=dtype))
 
         self.time_embedding = nn.Sequential(
-            operations.Linear(freq_dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")), nn.SiLU(), operations.Linear(dim, dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
-        self.time_projection = nn.Sequential(nn.SiLU(), operations.Linear(dim, dim * 6, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")))
+            operations.Linear(freq_dim, dim, device=device, dtype=dtype),
+            nn.SiLU(),
+            operations.Linear(dim, dim, device=device, dtype=dtype))
+
+        self.time_projection = nn.Sequential(nn.SiLU(), operations.Linear(dim, dim * 6, device=device, dtype=dtype))
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
-            wan_attn_block_class(cross_attn_type, dim, ffn_dim, num_heads,
-                                 window_size, qk_norm, cross_attn_norm, eps, operation_settings=operation_settings)
+            wan_attn_block_class(device, operations, cross_attn_type, dim, ffn_dim, num_heads,
+                                 window_size, qk_norm, cross_attn_norm, eps, dtype=dtype)
             for i in range(num_layers)
         ])
 
         # head
-        self.head = Head(dim, out_dim, patch_size, eps, operation_settings=operation_settings)
+        self.head = Head(device, operations, dim, out_dim, patch_size, eps, dtype=dtype)
 
         d = dim // num_heads
         self.rope_embedder = EmbedND(dim=d, theta=10000.0, axes_dim=[d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)])
 
         if model_type == 'i2v':
-            self.img_emb = MLPProj(1280, dim, flf_pos_embed_token_number=flf_pos_embed_token_number, operation_settings=operation_settings)
+            self.img_emb = MLPProj(device, operations, 1280, dim, flf_pos_embed_token_number=flf_pos_embed_token_number, dtype=dtype)
         else:
             self.img_emb = None
 
         if in_dim_ref_conv is not None:
-            self.ref_conv = operations.Conv2d(in_dim_ref_conv, dim, kernel_size=patch_size[1:], stride=patch_size[1:], device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+            self.ref_conv = operations.Conv2d(in_dim_ref_conv, dim, kernel_size=patch_size[1:], stride=patch_size[1:], device=device, dtype=dtype)
         else:
             self.ref_conv = None
 
@@ -740,6 +755,7 @@ class VaceWanModel(WanModel):
 
     def __init__(self,
                  device,
+                 operations,
                  model_type='vace',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -760,11 +776,9 @@ class VaceWanModel(WanModel):
                  vace_layers=None,
                  vace_in_dim=None,
                  dtype=None,
-                 operations=None,
                  ):
 
-        super().__init__(model_type='t2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, image_model=image_model, device=device, dtype=dtype, operations=operations)
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
+        super().__init__(device, operations, model_type='t2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, image_model=image_model, dtype=dtype)
 
         # Vace
         if vace_layers is not None:
@@ -772,7 +786,7 @@ class VaceWanModel(WanModel):
             self.vace_in_dim = vace_in_dim
             # vace blocks
             self.vace_blocks = nn.ModuleList([
-                VaceWanAttentionBlock('t2v_cross_attn', self.dim, self.ffn_dim, self.num_heads, self.window_size, self.qk_norm, self.cross_attn_norm, self.eps, block_id=i, operation_settings=operation_settings)
+                VaceWanAttentionBlock(device, operations, 't2v_cross_attn', self.dim, self.ffn_dim, self.num_heads, self.window_size, self.qk_norm, self.cross_attn_norm, self.eps, block_id=i, dtype=dtype)
                 for i in range(self.vace_layers)
             ])
 
@@ -867,6 +881,7 @@ class CameraWanModel(WanModel):
 
     def __init__(self,
                  device,
+                 operations,
                  model_type='camera',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -886,7 +901,6 @@ class CameraWanModel(WanModel):
                  image_model=None,
                  in_dim_control_adapter=24,
                  dtype=None,
-                 operations=None,
                  ):
 
         if model_type == 'camera':
@@ -894,10 +908,9 @@ class CameraWanModel(WanModel):
         else:
             model_type = 't2v'
 
-        super().__init__(model_type=model_type, patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, image_model=image_model, device=device, dtype=dtype, operations=operations)
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
+        super().__init__(device, operations, model_type=model_type, patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, image_model=image_model, dtype=dtype)
 
-        self.control_adapter = WanCamAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:], operation_settings=operation_settings)
+        self.control_adapter = WanCamAdapter(device, operations, in_dim_control_adapter, dim, patch_size[1:], patch_size[1:], dtype=dtype)
 
 
     def forward_orig(
@@ -967,14 +980,15 @@ class CameraWanModel(WanModel):
 class CausalConv1d(nn.Module):
 
     def __init__(self,
+                 device,
+                 operations,
                  chan_in,
                  chan_out,
                  kernel_size=3,
                  stride=1,
                  dilation=1,
                  pad_mode='replicate',
-                 operations=None,
-                 **kwargs):
+                 dtype=None):
         super().__init__()
 
         self.pad_mode = pad_mode
@@ -987,7 +1001,7 @@ class CausalConv1d(nn.Module):
             kernel_size,
             stride=stride,
             dilation=dilation,
-            **kwargs)
+            device=device, dtype=dtype)
 
     def forward(self, x):
         x = torch.nn.functional.pad(x, self.time_causal_padding, mode=self.pad_mode)
@@ -997,50 +1011,49 @@ class CausalConv1d(nn.Module):
 class MotionEncoder_tc(nn.Module):
 
     def __init__(self,
+                 device,
+                 operations,
                  in_dim: int,
                  hidden_dim: int,
                  num_heads: int,
                  need_global=True,
-                 dtype=None,
-                 device=None,
-                 operations=None,):
-        factory_kwargs = {"dtype": dtype, "device": device}
+                 dtype=None):
         super().__init__()
 
         self.num_heads = num_heads
         self.need_global = need_global
-        self.conv1_local = CausalConv1d(in_dim, hidden_dim // 4 * num_heads, 3, stride=1, operations=operations, **factory_kwargs)
+        self.conv1_local = CausalConv1d(device, operations, in_dim, hidden_dim // 4 * num_heads, 3, stride=1, dtype=dtype)
         if need_global:
             self.conv1_global = CausalConv1d(
-                in_dim, hidden_dim // 4, 3, stride=1, operations=operations, **factory_kwargs)
+                device, operations, in_dim, hidden_dim // 4, 3, stride=1, dtype=dtype)
         self.norm1 = operations.LayerNorm(
             hidden_dim // 4,
             elementwise_affine=False,
             eps=1e-6,
-            **factory_kwargs)
+            device=device, dtype=dtype)
         self.act = nn.SiLU()
-        self.conv2 = CausalConv1d(hidden_dim // 4, hidden_dim // 2, 3, stride=2, operations=operations, **factory_kwargs)
-        self.conv3 = CausalConv1d(hidden_dim // 2, hidden_dim, 3, stride=2, operations=operations, **factory_kwargs)
+        self.conv2 = CausalConv1d(device, operations, hidden_dim // 4, hidden_dim // 2, 3, stride=2, dtype=dtype)
+        self.conv3 = CausalConv1d(device, operations, hidden_dim // 2, hidden_dim, 3, stride=2, dtype=dtype)
 
         if need_global:
-            self.final_linear = operations.Linear(hidden_dim, hidden_dim, **factory_kwargs)
+            self.final_linear = operations.Linear(hidden_dim, hidden_dim, device=device, dtype=dtype)
 
         self.norm1 = operations.LayerNorm(
             hidden_dim // 4,
             elementwise_affine=False,
             eps=1e-6,
-            **factory_kwargs)
+            device=device, dtype=dtype)
 
         self.norm2 = operations.LayerNorm(
             hidden_dim // 2,
             elementwise_affine=False,
             eps=1e-6,
-            **factory_kwargs)
+            device=device, dtype=dtype)
 
-        self.norm3 = operations.LayerNorm(
-            hidden_dim, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.norm3 = operations.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
 
-        self.padding_tokens = nn.Parameter(torch.empty(1, 1, 1, hidden_dim, **factory_kwargs))
+        self.padding_tokens = nn.Parameter(torch.empty(1, 1, 1, hidden_dim, device=device, dtype=dtype))
+
 
     def forward(self, x):
         x = rearrange(x, 'b t c -> b c t')
@@ -1091,21 +1104,19 @@ class MotionEncoder_tc(nn.Module):
 class CausalAudioEncoder(nn.Module):
 
     def __init__(self,
+                 device,
+                 operations,
                  dim=5120,
                  num_layers=25,
                  out_dim=2048,
                  video_rate=8,
                  num_token=4,
                  need_global=False,
-                 dtype=None,
-                 device=None,
-                 operations=None):
+                 dtype=None):
         super().__init__()
         self.encoder = MotionEncoder_tc(
-            in_dim=dim,
-            hidden_dim=out_dim,
-            num_heads=num_token,
-            need_global=need_global, dtype=dtype, device=device, operations=operations)
+            device, operations, dim, out_dim, num_token,
+            need_global=need_global, dtype=dtype)
         weight = torch.empty((1, num_layers, 1, 1), dtype=dtype, device=device)
 
         self.weights = torch.nn.Parameter(weight)
@@ -1123,7 +1134,7 @@ class CausalAudioEncoder(nn.Module):
 
 
 class AdaLayerNorm(nn.Module):
-    def __init__(self, embedding_dim, output_dim=None, norm_elementwise_affine=False, norm_eps=1e-5, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, embedding_dim, output_dim=None, norm_elementwise_affine=False, norm_eps=1e-5, dtype=None):
         super().__init__()
 
         output_dim = output_dim or embedding_dim * 2
@@ -1144,6 +1155,8 @@ class AdaLayerNorm(nn.Module):
 class AudioInjector_WAN(nn.Module):
 
     def __init__(self,
+                 device,
+                 operations,
                  dim=2048,
                  num_heads=32,
                  inject_layer=[0, 27],
@@ -1151,9 +1164,7 @@ class AudioInjector_WAN(nn.Module):
                  enable_adain=False,
                  adain_dim=2048,
                  adain_mode=None,
-                 dtype=None,
-                 device=None,
-                 operations=None):
+                 dtype=None):
         super().__init__()
         self.enable_adain = enable_adain
         self.adain_mode = adain_mode
@@ -1165,9 +1176,9 @@ class AudioInjector_WAN(nn.Module):
 
         self.injector = nn.ModuleList([
             WanT2VCrossAttention(
-                dim=dim,
+                device, operations, dim,
                 num_heads=num_heads,
-                qk_norm=True, operation_settings={"operations": operations, "device": device, "dtype": dtype}
+                qk_norm=True, dtype=dtype
             ) for _ in range(audio_injector_id)
         ])
         self.injector_pre_norm_feat = nn.ModuleList([
@@ -1187,7 +1198,7 @@ class AudioInjector_WAN(nn.Module):
         if enable_adain:
             self.injector_adain_layers = nn.ModuleList([
                 AdaLayerNorm(
-                    output_dim=dim * 2, embedding_dim=adain_dim, dtype=dtype, device=device, operations=operations)
+                    device, operations, adain_dim, dim * 2, dtype=dtype)
                 for _ in range(audio_injector_id)
             ])
             if adain_mode != "attn_norm":
@@ -1222,15 +1233,15 @@ class AudioInjector_WAN(nn.Module):
 class FramePackMotioner(nn.Module):
     def __init__(
             self,
+            device,
+            operations,
             inner_dim=1024,
             num_heads=16,  # Used to indicate the number of heads in the backbone network; unrelated to this module's design
             zip_frame_buckets=[
                 1, 2, 16
             ],  # Three numbers representing the number of frames sampled for patch operations from the nearest to the farthest frames
             drop_mode="drop",  # If not "drop", it will use "padd", meaning padding instead of deletion
-            dtype=None,
-            device=None,
-            operations=None):
+            dtype=None):
         super().__init__()
         self.proj = operations.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2), dtype=dtype, device=device)
         self.proj_2x = operations.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4), dtype=dtype, device=device)
@@ -1283,6 +1294,7 @@ class FramePackMotioner(nn.Module):
 class WanModel_S2V(WanModel):
     def __init__(self,
                  device,
+                 operations,
                  model_type='s2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -1307,18 +1319,17 @@ class WanModel_S2V(WanModel):
                  framepack_drop_mode="padd",
                  image_model=None,
                  dtype=None,
-                 operations=None,
                  ):
 
-        super().__init__(model_type='t2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, image_model=image_model, device=device, dtype=dtype, operations=operations)
+        super().__init__(device, operations, model_type='t2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, image_model=image_model, dtype=dtype)
 
         self.trainable_cond_mask = operations.Embedding(3, self.dim, device=device, dtype=dtype)
 
         self.casual_audio_encoder = CausalAudioEncoder(
-            dim=audio_dim,
+            device, operations, dim=audio_dim,
             out_dim=self.dim,
             num_token=num_audio_token,
-            need_global=enable_adain, dtype=dtype, device=device, operations=operations)
+            need_global=enable_adain, dtype=dtype)
 
         if cond_dim > 0:
             self.cond_encoder = operations.Conv3d(
@@ -1328,6 +1339,7 @@ class WanModel_S2V(WanModel):
                 stride=self.patch_size, device=device, dtype=dtype)
 
         self.audio_injector = AudioInjector_WAN(
+            device, operations,
             dim=self.dim,
             num_heads=self.num_heads,
             inject_layer=audio_inject_layers,
@@ -1335,15 +1347,16 @@ class WanModel_S2V(WanModel):
             enable_adain=enable_adain,
             adain_dim=self.dim,
             adain_mode=adain_mode,
-            dtype=dtype, device=device, operations=operations
+            dtype=dtype
         )
 
         self.frame_packer = FramePackMotioner(
+            device, operations,
             inner_dim=self.dim,
             num_heads=self.num_heads,
             zip_frame_buckets=[1, 2, 16],
             drop_mode=framepack_drop_mode,
-            dtype=dtype, device=device, operations=operations)
+            dtype=dtype)
 
     def forward_orig(
         self,
@@ -1464,7 +1477,7 @@ class WanT2VCrossAttentionGather(WanSelfAttention):
         # Handle video spatial structure
         q = q.reshape(k.shape[0], -1, n, d).transpose(1, 2)
 
-        x = optimized_attention(q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options)
+        x = self.optimized_attention(q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options)
 
         x = x.transpose(1, 2).reshape(b, -1, n * d)
         x = self.o(x)
@@ -1472,11 +1485,11 @@ class WanT2VCrossAttentionGather(WanSelfAttention):
 
 
 class AudioCrossAttentionWrapper(nn.Module):
-    def __init__(self, dim, kv_dim, num_heads, qk_norm=True, eps=1e-6, operation_settings={}):
+    def __init__(self, device, operations, dim, kv_dim, num_heads, qk_norm=True, eps=1e-6, dtype=None):
         super().__init__()
 
-        self.audio_cross_attn = WanT2VCrossAttentionGather(dim, num_heads, qk_norm=qk_norm, kv_dim=kv_dim, eps=eps, operation_settings=operation_settings)
-        self.norm1_audio = operation_settings.get("operations").LayerNorm(dim, eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.audio_cross_attn = WanT2VCrossAttentionGather(device, operations, dim, num_heads, qk_norm=qk_norm, kv_dim=kv_dim, eps=eps, dtype=dtype)
+        self.norm1_audio = operations.LayerNorm(dim, eps, elementwise_affine=True, device=device, dtype=dtype)
 
     def forward(self, x, audio, transformer_options={}):
         x = x + self.audio_cross_attn(self.norm1_audio(x), audio, transformer_options=transformer_options)
@@ -1486,6 +1499,8 @@ class AudioCrossAttentionWrapper(nn.Module):
 class WanAttentionBlockAudio(WanAttentionBlock):
 
     def __init__(self,
+                 device,
+                 operations,
                  cross_attn_type,
                  dim,
                  ffn_dim,
@@ -1493,9 +1508,9 @@ class WanAttentionBlockAudio(WanAttentionBlock):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6, operation_settings={}):
-        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, operation_settings)
-        self.audio_cross_attn_wrapper = AudioCrossAttentionWrapper(dim, 1536, num_heads, qk_norm, eps, operation_settings=operation_settings)
+                 eps=1e-6, dtype=None):
+        super().__init__(device, operations, cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, dtype=dtype)
+        self.audio_cross_attn_wrapper = AudioCrossAttentionWrapper(device, operations, dim, 1536, num_heads, qk_norm, eps, dtype=dtype)
 
     def forward(
         self,
@@ -1548,15 +1563,15 @@ class DummyAdapterLayer(nn.Module):
 class AudioProjModel(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         seq_len=5,
         blocks=13,  # add a new parameter blocks
         channels=768,  # add a new parameter channels
         intermediate_dim=512,
         output_dim=1536,
         context_tokens=16,
-        device=None,
         dtype=None,
-        operations=None,
     ):
         super().__init__()
 
@@ -1599,6 +1614,7 @@ class HumoWanModel(WanModel):
 
     def __init__(self,
                  device,
+                 operations,
                  model_type='humo',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -1618,12 +1634,11 @@ class HumoWanModel(WanModel):
                  image_model=None,
                  audio_token_num=16,
                  dtype=None,
-                 operations=None,
                  ):
 
-        super().__init__(model_type='t2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, wan_attn_block_class=WanAttentionBlockAudio, image_model=image_model, device=device, dtype=dtype, operations=operations)
+        super().__init__(device, operations, model_type='t2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, wan_attn_block_class=WanAttentionBlockAudio, image_model=image_model, dtype=dtype)
 
-        self.audio_proj = AudioProjModel(seq_len=8, blocks=5, channels=1280, intermediate_dim=512, output_dim=1536, context_tokens=audio_token_num, dtype=dtype, device=device, operations=operations)
+        self.audio_proj = AudioProjModel(device, operations, seq_len=8, blocks=5, channels=1280, intermediate_dim=512, output_dim=1536, context_tokens=audio_token_num, dtype=dtype)
 
     def forward_orig(
         self,
@@ -1700,8 +1715,8 @@ class HumoWanModel(WanModel):
         return x
 
 class SCAILWanModel(WanModel):
-    def __init__(self, device, model_type="scail", patch_size=(1, 2, 2), in_dim=20, dim=5120, operations=None, dtype=None, **kwargs):
-        super().__init__(model_type='i2v', patch_size=patch_size, in_dim=in_dim, dim=dim, operations=operations, device=device, dtype=dtype, **kwargs)
+    def __init__(self, device, operations, model_type="scail", patch_size=(1, 2, 2), in_dim=20, dim=5120, dtype=None, **kwargs):
+        super().__init__(device, operations, model_type='i2v', patch_size=patch_size, in_dim=in_dim, dim=dim, dtype=dtype, **kwargs)
 
         self.patch_embedding_pose = operations.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)
 
@@ -1868,6 +1883,6 @@ class SCAILWanModel(WanModel):
 class SCAIL2WanModel(SCAILWanModel):
     """SCAIL-2: SCAIL-Preview + an additive binary multi-identity mask stream."""
 
-    def __init__(self, device, model_type="scail2", patch_size=(1, 2, 2), in_dim=20, mask_in_dim=28, dim=5120, operations=None, dtype=None, **kwargs):
-        super().__init__(model_type=model_type, patch_size=patch_size, in_dim=in_dim, dim=dim, operations=operations, device=device, dtype=dtype, **kwargs)
+    def __init__(self, device, operations, model_type="scail2", patch_size=(1, 2, 2), in_dim=20, mask_in_dim=28, dim=5120, dtype=None, **kwargs):
+        super().__init__(device, operations, model_type=model_type, patch_size=patch_size, in_dim=in_dim, dim=dim, dtype=dtype, **kwargs)
         self.patch_embedding_mask = operations.Conv3d(mask_in_dim, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=torch.float32)

@@ -202,7 +202,6 @@ class HunyuanVideo(nn.Module):
     def __init__(self, device, image_model=None, final_layer=True, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
 
         params = HunyuanVideoParams(**kwargs)
         self.params = params
@@ -279,7 +278,7 @@ class HunyuanVideo(nn.Module):
         # HunyuanVideo 1.5 specific modules
         if self.vision_in_dim is not None:
             from comfy.ldm.wan.model import MLPProj
-            self.vision_in = MLPProj(in_dim=self.vision_in_dim, out_dim=self.hidden_size, operation_settings=operation_settings)
+            self.vision_in = MLPProj(device, operations, self.vision_in_dim, self.hidden_size, dtype=dtype)
         else:
             self.vision_in = None
         if self.use_cond_type_embedding:

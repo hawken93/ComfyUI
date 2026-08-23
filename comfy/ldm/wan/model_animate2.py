@@ -14,7 +14,7 @@ import comfy.model_management
 import comfy.quant_ops
 import comfy.utils
 from comfy.ldm.flux.math import apply_rope1
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 from .model import WanAttentionBlock, WanModel, WanSelfAttention, repeat_e, sinusoidal_embedding_1d
 
@@ -39,7 +39,7 @@ class WanAnimate2SelfAttention(WanSelfAttention):
     def forward_pose(self, x, freqs, transformer_options={}):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q, k, v = self.qkv(x, freqs)
-        out = optimized_attention(q.reshape(b, s, n * d), k.reshape(b, s, n * d), v.reshape(b, s, n * d), heads=self.num_heads, transformer_options=transformer_options)
+        out = self.optimized_attention(q.reshape(b, s, n * d), k.reshape(b, s, n * d), v.reshape(b, s, n * d), heads=self.num_heads, transformer_options=transformer_options)
         return self.o(self._attn1_patch(out, q, k, transformer_options)), k, v
 
     def forward_gen(self, x, freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, transformer_options={}):
@@ -50,7 +50,7 @@ class WanAnimate2SelfAttention(WanSelfAttention):
             v[:, :hw] *= ref_strength  # frame 0 is the reference image's slot
 
         if k_pose is None:  # pose influence windowed out: plain self-attention, no per-frame loop
-            out = optimized_attention(q.reshape(b, s, n * d), k.reshape(b, s, n * d), v.reshape(b, s, n * d), heads=self.num_heads, transformer_options=transformer_options)
+            out = self.optimized_attention(q.reshape(b, s, n * d), k.reshape(b, s, n * d), v.reshape(b, s, n * d), heads=self.num_heads, transformer_options=transformer_options)
             return self.o(self._attn1_patch(out, q, k, transformer_options))
 
         # gen half is the same every frame; only the hw-token pose tail is rewritten
@@ -66,15 +66,15 @@ class WanAnimate2SelfAttention(WanSelfAttention):
                 kbuf[:, s:] = k_pose[:, (j - 1) * hw:j * hw]
                 vbuf[:, s:] = v_pose[:, (j - 1) * hw:j * hw]
                 kk, vv = kbuf, vbuf
-            out[:, j * hw:(j + 1) * hw] = optimized_attention(q_j, kk.reshape(b, kk.shape[1], n * d), vv.reshape(b, kk.shape[1], n * d), heads=self.num_heads, transformer_options=transformer_options)
+            out[:, j * hw:(j + 1) * hw] = self.optimized_attention(q_j, kk.reshape(b, kk.shape[1], n * d), vv.reshape(b, kk.shape[1], n * d), heads=self.num_heads, transformer_options=transformer_options)
         return self.o(self._attn1_patch(out, q, k, transformer_options))
 
 
 class WanAnimate2Block(WanAttentionBlock):
 
-    def __init__(self, cross_attn_type, dim, ffn_dim, num_heads, window_size=(-1, -1), qk_norm=True, cross_attn_norm=False, eps=1e-6, operation_settings={}):
-        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, operation_settings=operation_settings)
-        self.self_attn = WanAnimate2SelfAttention(dim, num_heads, window_size, qk_norm, eps, operation_settings=operation_settings)
+    def __init__(self, device, operations, cross_attn_type, dim, ffn_dim, num_heads, window_size=(-1, -1), qk_norm=True, cross_attn_norm=False, eps=1e-6, dtype=None):
+        super().__init__(device, operations, cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, dtype=dtype)
+        self.self_attn = WanAnimate2SelfAttention(device, operations, dim, num_heads, window_size, qk_norm, eps, dtype=dtype)
 
     def _modulation(self, e, x):
         if e.ndim < 4:
@@ -121,8 +121,8 @@ class PoseBranchCache:
 
     CONVROT_GROUPSIZE = 256
 
-    def __init__(self, store_device=None, dtype="default"):
-        self.store_device = torch.device(store_device) if store_device is not None else torch.device("cpu")
+    def __init__(self, device, dtype="default"):
+        self.device = device
         self.dtype = dtype
         self.slots = []  # most recently used last
         self.slot = None
@@ -146,9 +146,9 @@ class PoseBranchCache:
                 return
         # cache what fits: a filled slot is the size estimate for the next one, and least recently used slots make room when the store device runs low
         est = max((self._slot_bytes(s) for s in self.slots), default=0) * 1.5
-        while self.slots and comfy.model_management.get_free_memory(self.store_device) < est:
+        while self.slots and comfy.model_management.get_free_memory(self.device) < est:
             self._free_slot(self.slots.pop(0))
-        self.slot = {"key": k.clone().to(self.store_device), "blocks": {}, "params": {}, "shape": None, "pinned": []}
+        self.slot = {"key": k.clone().to(self.device), "blocks": {}, "params": {}, "shape": None, "pinned": []}
         self.slots.append(self.slot)
 
     def _free_slot(self, s):
@@ -183,12 +183,12 @@ class PoseBranchCache:
             else:
                 t, params = comfy.quant_ops.TensorWiseINT8Layout.quantize(t.reshape(-1, t.shape[-1]), is_weight=True, per_channel=True, convrot=True, convrot_groupsize=g)
 
-        t = t.to(self.store_device, copy=True)
+        t = t.to(self.device, copy=True)
         if comfy.model_management.pin_memory(t):
             self.slot["pinned"].append(t)
         self.slot["blocks"][i] = t
         # the scales follow the blocks off the GPU: per-window slots would otherwise pile them up in VRAM (~200 MB per window at 480p int4)
-        self.slot["params"][i] = params if params is None else params.to_device(self.store_device)
+        self.slot["params"][i] = params if params is None else params.to_device(self.device)
 
     def prefetch(self, i, device, dtype):
         # call before the compute this should overlap, so the stream waits only on work already enqueued
@@ -233,6 +233,7 @@ class WanAnimate2Model(WanModel):
 
     def __init__(self,
                  device,
+                 operations,
                  model_type='animate2',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -251,13 +252,14 @@ class WanAnimate2Model(WanModel):
                  flf_pos_embed_token_number=None,
                  in_dim_ref_conv=None,
                  image_model=None,
-                 dtype=None, operations=None,
+                 dtype=None,
                  ):
         # model_type is 'animate2' in unet_config, but the checkpoint is i2v-shaped
-        super().__init__(model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim,
-                         text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm,
-                         cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, in_dim_ref_conv=in_dim_ref_conv,
-                         wan_attn_block_class=WanAnimate2Block, image_model=image_model, device=device, dtype=dtype, operations=operations)
+        super().__init__(device, operations, model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim,
+                         ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads,
+                         num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm,
+                         eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, in_dim_ref_conv=in_dim_ref_conv,
+                         wan_attn_block_class=WanAnimate2Block, image_model=image_model, dtype=dtype)
 
     def rope_encode_pose(self, t, h, w, w_patches, device=None, dtype=None):
         # t_start=1 lines pose frame j up with gen frame j+1, past the reference slot; shift_x parks it in its own strip of rope space.
