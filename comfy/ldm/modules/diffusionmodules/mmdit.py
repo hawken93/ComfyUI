@@ -4,7 +4,7 @@ from typing import Dict, Optional, List
 import numpy as np
 import torch
 import torch.nn as nn
-from ..attention import optimized_attention
+from ..attention import optimized_attention_for_device
 from einops import rearrange, repeat
 from .util import timestep_embedding
 import comfy.ops
@@ -20,6 +20,7 @@ class Mlp(nn.Module):
     """
     def __init__(
             self,
+            device,
             in_features,
             hidden_features=None,
             out_features=None,
@@ -29,7 +30,6 @@ class Mlp(nn.Module):
             drop=0.,
             use_conv=False,
             dtype=None,
-            device=None,
             operations=None,
     ):
         super().__init__()
@@ -61,6 +61,7 @@ class PatchEmbed(nn.Module):
 
     def __init__(
             self,
+            device,
             img_size: Optional[int] = 224,
             patch_size: int = 16,
             in_chans: int = 3,
@@ -73,7 +74,6 @@ class PatchEmbed(nn.Module):
             padding_mode='circular',
             conv3d=False,
             dtype=None,
-            device=None,
             operations=None,
     ):
         super().__init__()
@@ -211,7 +211,7 @@ class TimestepEmbedder(nn.Module):
     Embeds scalar timesteps into vector representations.
     """
 
-    def __init__(self, hidden_size, frequency_embedding_size=256, output_size=None, dtype=None, device=None, operations=None, max_period=10000):
+    def __init__(self, device, hidden_size, frequency_embedding_size=256, output_size=None, dtype=None, operations=None, max_period=10000):
         super().__init__()
         if output_size is None:
             output_size = hidden_size
@@ -234,7 +234,7 @@ class VectorEmbedder(nn.Module):
     Embeds a flat vector of dimension input_dim
     """
 
-    def __init__(self, input_dim: int, hidden_size: int, dtype=None, device=None, operations=None):
+    def __init__(self, device, input_dim: int, hidden_size: int, dtype=None, operations=None):
         super().__init__()
         self.mlp = nn.Sequential(
             operations.Linear(input_dim, hidden_size, bias=True, dtype=dtype, device=device),
@@ -262,6 +262,7 @@ class SelfAttention(nn.Module):
 
     def __init__(
         self,
+        device,
         dim: int,
         num_heads: int = 8,
         qkv_bias: bool = False,
@@ -272,7 +273,6 @@ class SelfAttention(nn.Module):
         qk_norm: Optional[str] = None,
         rmsnorm: bool = False,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -288,8 +288,8 @@ class SelfAttention(nn.Module):
         self.pre_only = pre_only
 
         if qk_norm == "rms":
-            self.ln_q = RMSNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6, dtype=dtype, device=device)
-            self.ln_k = RMSNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6, dtype=dtype, device=device)
+            self.ln_q = RMSNorm(device, self.head_dim, elementwise_affine=True, eps=1.0e-6, dtype=dtype)
+            self.ln_k = RMSNorm(device, self.head_dim, elementwise_affine=True, eps=1.0e-6, dtype=dtype)
         elif qk_norm == "ln":
             self.ln_q = operations.LayerNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6, dtype=dtype, device=device)
             self.ln_k = operations.LayerNorm(self.head_dim, elementwise_affine=True, eps=1.0e-6, dtype=dtype, device=device)
@@ -298,6 +298,7 @@ class SelfAttention(nn.Module):
             self.ln_k = nn.Identity()
         else:
             raise ValueError(qk_norm)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def pre_attention(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
@@ -315,7 +316,7 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.pre_attention(x)
-        x = optimized_attention(
+        x = self.optimized_attention(
             q, k, v, heads=self.num_heads
         )
         x = self.post_attention(x)
@@ -324,7 +325,7 @@ class SelfAttention(nn.Module):
 
 class RMSNorm(torch.nn.Module):
     def __init__(
-        self, dim: int, elementwise_affine: bool = False, eps: float = 1e-6, device=None, dtype=None, **kwargs
+        self, device, dim: int, elementwise_affine: bool = False, eps: float = 1e-6, dtype=None, **kwargs
     ):
         """
         Initialize the RMSNorm normalization layer.
@@ -395,6 +396,7 @@ class DismantledBlock(nn.Module):
 
     def __init__(
         self,
+        device,
         hidden_size: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
@@ -407,7 +409,6 @@ class DismantledBlock(nn.Module):
         qk_norm: Optional[str] = None,
         x_block_self_attn: bool = False,
         dtype=None,
-        device=None,
         operations=None,
         **block_kwargs,
     ):
@@ -416,8 +417,9 @@ class DismantledBlock(nn.Module):
         if not rmsnorm:
             self.norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         else:
-            self.norm1 = RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm1 = RMSNorm(device, hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = SelfAttention(
+            device,
             dim=hidden_size,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -426,7 +428,6 @@ class DismantledBlock(nn.Module):
             qk_norm=qk_norm,
             rmsnorm=rmsnorm,
             dtype=dtype,
-            device=device,
             operations=operations
         )
         if x_block_self_attn:
@@ -434,6 +435,7 @@ class DismantledBlock(nn.Module):
             assert not scale_mod_only
             self.x_block_self_attn = True
             self.attn2 = SelfAttention(
+                device,
                 dim=hidden_size,
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
@@ -453,7 +455,7 @@ class DismantledBlock(nn.Module):
                     hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device
                 )
             else:
-                self.norm2 = RMSNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+                self.norm2 = RMSNorm(device, hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         if not pre_only:
             if not swiglu:
@@ -577,18 +579,18 @@ class DismantledBlock(nn.Module):
         assert not self.pre_only
         if self.x_block_self_attn:
             qkv, qkv2, intermediates = self.pre_attention_x(x, c)
-            attn, _ = optimized_attention(
+            attn, _ = self.attn.optimized_attention(
                 qkv[0], qkv[1], qkv[2],
                 num_heads=self.attn.num_heads,
             )
-            attn2, _ = optimized_attention(
+            attn2, _ = self.attn2.optimized_attention(
                 qkv2[0], qkv2[1], qkv2[2],
                 num_heads=self.attn2.num_heads,
             )
             return self.post_attention_x(attn, attn2, *intermediates)
         else:
             qkv, intermediates = self.pre_attention(x, c)
-            attn = optimized_attention(
+            attn = self.attn.optimized_attention(
                 qkv[0], qkv[1], qkv[2],
                 heads=self.attn.num_heads,
             )
@@ -622,7 +624,7 @@ def _block_mixing(context, x, context_block, x_block, c, transformer_options={})
         o.append(torch.cat((context_qkv[t], x_qkv[t]), dim=1))
     qkv = tuple(o)
 
-    attn = optimized_attention(
+    attn = x_block.attn.optimized_attention(
         qkv[0], qkv[1], qkv[2],
         heads=x_block.attn.num_heads,
         transformer_options=transformer_options,
@@ -638,7 +640,7 @@ def _block_mixing(context, x, context_block, x_block, c, transformer_options={})
     else:
         context = None
     if x_block.x_block_self_attn:
-        attn2 = optimized_attention(
+        attn2 = x_block.attn2.optimized_attention(
                 x_qkv2[0], x_qkv2[1], x_qkv2[2],
                 heads=x_block.attn2.num_heads,
                 transformer_options=transformer_options,
@@ -661,8 +663,9 @@ class JointBlock(nn.Module):
         pre_only = kwargs.pop("pre_only")
         qk_norm = kwargs.pop("qk_norm", None)
         x_block_self_attn = kwargs.pop("x_block_self_attn", False)
-        self.context_block = DismantledBlock(*args, pre_only=pre_only, qk_norm=qk_norm, **kwargs)
-        self.x_block = DismantledBlock(*args,
+        device = kwargs.pop("device")
+        self.context_block = DismantledBlock(device, *args, pre_only=pre_only, qk_norm=qk_norm, **kwargs)
+        self.x_block = DismantledBlock(device, *args,
                                        pre_only=False,
                                        qk_norm=qk_norm,
                                        x_block_self_attn=x_block_self_attn,
@@ -681,12 +684,12 @@ class FinalLayer(nn.Module):
 
     def __init__(
         self,
+        device,
         hidden_size: int,
         patch_size: int,
         out_channels: int,
         total_out_channels: Optional[int] = None,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -707,7 +710,7 @@ class FinalLayer(nn.Module):
         return x
 
 class SelfAttentionContext(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dtype=None, device=None, operations=None):
+    def __init__(self, device, dim, heads=8, dim_head=64, dtype=None, operations=None):
         super().__init__()
         dim_head = dim // heads
         inner_dim = dim
@@ -718,18 +721,19 @@ class SelfAttentionContext(nn.Module):
         self.qkv = operations.Linear(dim, dim * 3, bias=True, dtype=dtype, device=device)
 
         self.proj = operations.Linear(inner_dim, dim, dtype=dtype, device=device)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x):
         qkv = self.qkv(x)
         q, k, v = split_qkv(qkv, self.dim_head)
-        x = optimized_attention(q.reshape(q.shape[0], q.shape[1], -1), k, v, heads=self.heads)
+        x = self.optimized_attention(q.reshape(q.shape[0], q.shape[1], -1), k, v, heads=self.heads)
         return self.proj(x)
 
 class ContextProcessorBlock(nn.Module):
-    def __init__(self, context_size, dtype=None, device=None, operations=None):
+    def __init__(self, device, context_size, dtype=None, operations=None):
         super().__init__()
         self.norm1 = operations.LayerNorm(context_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.attn = SelfAttentionContext(context_size, dtype=dtype, device=device, operations=operations)
+        self.attn = SelfAttentionContext(device, context_size, dtype=dtype, operations=operations)
         self.norm2 = operations.LayerNorm(context_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.mlp = Mlp(in_features=context_size, hidden_features=(context_size * 4), act_layer=lambda: nn.GELU(approximate="tanh"), drop=0, dtype=dtype, device=device, operations=operations)
 
@@ -739,9 +743,9 @@ class ContextProcessorBlock(nn.Module):
         return x
 
 class ContextProcessor(nn.Module):
-    def __init__(self, context_size, num_layers, dtype=None, device=None, operations=None):
+    def __init__(self, device, context_size, num_layers, dtype=None, operations=None):
         super().__init__()
-        self.layers = torch.nn.ModuleList([ContextProcessorBlock(context_size, dtype=dtype, device=device, operations=operations) for i in range(num_layers)])
+        self.layers = torch.nn.ModuleList([ContextProcessorBlock(device, context_size, dtype=dtype, operations=operations) for i in range(num_layers)])
         self.norm = operations.LayerNorm(context_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
 
     def forward(self, x):
@@ -756,6 +760,7 @@ class MMDiT(nn.Module):
 
     def __init__(
         self,
+        device,
         input_size: int = 32,
         patch_size: int = 2,
         in_channels: int = 4,
@@ -788,7 +793,6 @@ class MMDiT(nn.Module):
         final_layer = True,
         skip_blocks = False,
         dtype = None, #TODO
-        device = None,
         operations = None,
     ):
         super().__init__()
@@ -816,6 +820,7 @@ class MMDiT(nn.Module):
         self.num_heads = num_heads
 
         self.x_embedder = PatchEmbed(
+            device,
             input_size,
             patch_size,
             in_channels,
@@ -823,18 +828,17 @@ class MMDiT(nn.Module):
             bias=True,
             strict_img_size=self.pos_embed_max_size is None,
             dtype=dtype,
-            device=device,
             operations=operations
         )
-        self.t_embedder = TimestepEmbedder(self.hidden_size, dtype=dtype, device=device, operations=operations)
+        self.t_embedder = TimestepEmbedder(device, self.hidden_size, dtype=dtype, operations=operations)
 
         self.y_embedder = None
         if adm_in_channels is not None:
             assert isinstance(adm_in_channels, int)
-            self.y_embedder = VectorEmbedder(adm_in_channels, self.hidden_size, dtype=dtype, device=device, operations=operations)
+            self.y_embedder = VectorEmbedder(device, adm_in_channels, self.hidden_size, dtype=dtype, operations=operations)
 
         if context_processor_layers is not None:
-            self.context_processor = ContextProcessor(context_size, context_processor_layers, dtype=dtype, device=device, operations=operations)
+            self.context_processor = ContextProcessor(device, context_size, context_processor_layers, dtype=dtype, operations=operations)
         else:
             self.context_processor = None
 
@@ -883,7 +887,7 @@ class MMDiT(nn.Module):
             )
 
         if final_layer:
-            self.final_layer = FinalLayer(self.hidden_size, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations)
+            self.final_layer = FinalLayer(device, self.hidden_size, patch_size, self.out_channels, dtype=dtype, operations=operations)
 
         if compile_core:
             assert False

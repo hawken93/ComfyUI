@@ -21,7 +21,7 @@ from comfy.ldm.seedvr.constants import (
     BYTEDANCE_VAE_TEMPORAL_DOWNSAMPLE,
     SEEDVR2_LATENT_CHANNELS,
 )
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.modules.diffusionmodules.model import vae_attention
 
 import math
@@ -298,6 +298,7 @@ class SpatialNorm(nn.Module):
 class Attention(nn.Module):
     def __init__(
         self,
+        device,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -334,7 +335,8 @@ class Attention(nn.Module):
         self.to_out.append(ops.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(nn.Identity())
 
-        self.optimized_vae_attention = vae_attention()
+        self.optimized_vae_attention = vae_attention(device)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(
         self,
@@ -375,7 +377,7 @@ class Attention(nn.Module):
             value = value.squeeze(1).transpose(1, 2).reshape(batch_size, head_dim, height, width)
             hidden_states = self.optimized_vae_attention(query, key, value).reshape(batch_size, self.heads, head_dim, height * width).transpose(2, 3)
         else:
-            hidden_states = optimized_attention(query, key, value, heads = self.heads, skip_reshape=True, skip_output_reshape=True)
+            hidden_states = self.optimized_attention(query, key, value, heads = self.heads, skip_reshape=True, skip_output_reshape=True)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -1012,6 +1014,7 @@ class UpDecoderBlock3D(nn.Module):
 class UNetMidBlock3D(nn.Module):
     def __init__(
         self,
+        device,
         in_channels: int,
         temb_channels: int,
         num_layers: int = 1,
@@ -1049,6 +1052,7 @@ class UNetMidBlock3D(nn.Module):
             if self.add_attention:
                 attentions.append(
                     Attention(
+                        device,
                         in_channels,
                         heads=in_channels // attention_head_dim,
                         dim_head=attention_head_dim,
@@ -1100,6 +1104,7 @@ class UNetMidBlock3D(nn.Module):
 class Encoder3D(nn.Module):
     def __init__(
         self,
+        device,
         in_channels: int = 3,
         out_channels: int = 3,
         down_block_types: Tuple[str, ...] = ("DownEncoderBlock3D",),
@@ -1152,6 +1157,7 @@ class Encoder3D(nn.Module):
             self.down_blocks.append(down_block)
 
         self.mid_block = UNetMidBlock3D(
+            device,
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             output_scale_factor=1,
@@ -1199,6 +1205,7 @@ class Decoder3D(nn.Module):
 
     def __init__(
         self,
+        device,
         in_channels: int = 3,
         out_channels: int = 3,
         up_block_types: Tuple[str, ...] = ("UpDecoderBlock3D",),
@@ -1229,6 +1236,7 @@ class Decoder3D(nn.Module):
         temb_channels = None
 
         self.mid_block = UNetMidBlock3D(
+            device,
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             output_scale_factor=1,
@@ -1302,6 +1310,7 @@ class Decoder3D(nn.Module):
 class VideoAutoencoderKL(nn.Module):
     def __init__(
         self,
+        device,
         in_channels: int = 3,
         out_channels: int = 3,
         layers_per_block: int = 2,
@@ -1319,7 +1328,9 @@ class VideoAutoencoderKL(nn.Module):
         up_block_types = ("UpDecoderBlock3D",) * 4
         super().__init__()
 
+        self.device = device
         self.encoder = Encoder3D(
+            device,
             in_channels=in_channels,
             out_channels=latent_channels,
             down_block_types=down_block_types,
@@ -1332,6 +1343,7 @@ class VideoAutoencoderKL(nn.Module):
         )
 
         self.decoder = Decoder3D(
+            device,
             in_channels=latent_channels,
             out_channels=out_channels,
             up_block_types=up_block_types,
@@ -1442,12 +1454,13 @@ class VideoAutoencoderKL(nn.Module):
 class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
     def __init__(
         self,
+        device,
         spatial_downsample_factor = 8,
         temporal_downsample_factor = 4,
     ):
         self.spatial_downsample_factor = spatial_downsample_factor
         self.temporal_downsample_factor = temporal_downsample_factor
-        super().__init__()
+        super().__init__(device)
         self.set_memory_limit(BYTEDANCE_VAE_CONV_MEM_GIB, BYTEDANCE_VAE_NORM_MEM_GIB)
 
     def forward(self, x: torch.FloatTensor):
@@ -1458,7 +1471,6 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
     def _encode_with_raw_latent(self, x):
         if x.ndim == 4:
             x = x.unsqueeze(2)
-        self.device = x.device
         p = super().encode(x)
         z = p.squeeze(2)
         return z, p
@@ -1503,7 +1515,6 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
         shift = BYTEDANCE_VAE_SHIFTING_FACTOR
         latent = latent / scale + shift
 
-        self.device = latent.device
         enable_tiling = seedvr2_tiling.get("enable_tiling", False)
 
         if enable_tiling:
@@ -1560,7 +1571,6 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
             overlap_x = overlap
         overlap_y = min(overlap_y, max(0, tile_y - 8))
         overlap_x = min(overlap_x, max(0, tile_x - 8))
-        self.device = x.device
         return tiled_vae(
             x,
             self,

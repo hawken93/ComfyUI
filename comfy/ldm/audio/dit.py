@@ -1,6 +1,6 @@
 # code adapted from: https://github.com/Stability-AI/stable-audio-tools
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import typing as tp
 
 import torch
@@ -23,7 +23,7 @@ def _left_pad_to_match(emb, target_len):
 
 
 class FourierFeatures(nn.Module):
-    def __init__(self, in_features, out_features, std=1., dtype=None, device=None):
+    def __init__(self, device, in_features, out_features, std=1., dtype=None):
         super().__init__()
         assert out_features % 2 == 0
         self.weight = nn.Parameter(torch.empty(
@@ -36,7 +36,7 @@ class FourierFeatures(nn.Module):
 
 # norms
 class LayerNorm(nn.Module):
-    def __init__(self, dim, bias=False, fix_scale=False, dtype=None, device=None):
+    def __init__(self, device, dim, bias=False, fix_scale=False, dtype=None):
         """
         bias-less layernorm has been shown to be more stable. most newer models have moved towards rmsnorm, also bias-less
         """
@@ -57,7 +57,7 @@ class LayerNorm(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, dtype=None, device=None):
+    def __init__(self, device, dim, dtype=None):
         super().__init__()
         self.gamma = nn.Parameter(torch.empty(dim, dtype=dtype, device=device))
 
@@ -68,13 +68,13 @@ class RMSNorm(nn.Module):
 class GLU(nn.Module):
     def __init__(
         self,
+        device,
         dim_in,
         dim_out,
         activation,
         use_conv = False,
         conv_kernel_size = 3,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -141,6 +141,7 @@ class ScaledSinusoidalEmbedding(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
+        device,
         dim,
         use_xpos = False,
         scale_base = 512,
@@ -148,7 +149,6 @@ class RotaryEmbedding(nn.Module):
         base = 10000,
         base_rescale_factor = 1.,
         dtype=None,
-        device=None,
     ):
         super().__init__()
         # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
@@ -225,6 +225,7 @@ def apply_rotary_pos_emb(t, freqs, scale = 1):
 class FeedForward(nn.Module):
     def __init__(
         self,
+        device,
         dim,
         dim_out = None,
         mult = 4,
@@ -234,7 +235,6 @@ class FeedForward(nn.Module):
         conv_kernel_size = 3,
         zero_init_output = True,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -247,7 +247,7 @@ class FeedForward(nn.Module):
         dim_out = dim if dim_out is None else dim_out
 
         if glu:
-            linear_in = GLU(dim, inner_dim, activation, dtype=dtype, device=device, operations=operations)
+            linear_in = GLU(device, dim, inner_dim, activation, dtype=dtype, operations=operations)
         else:
             linear_in = nn.Sequential(
                 rearrange('b n d -> b d n') if use_conv else nn.Identity(),
@@ -271,6 +271,7 @@ class FeedForward(nn.Module):
 class Attention(nn.Module):
     def __init__(
         self,
+        device,
         dim,
         dim_heads = 64,
         dim_context = None,
@@ -281,10 +282,10 @@ class Attention(nn.Module):
         natten_kernel_size = None,
         feat_scale = False,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
+        self.optimized_attention = optimized_attention_for_device(device)
         self.dim = dim
         self.dim_heads = dim_heads
         self.causal = causal
@@ -430,11 +431,11 @@ class Attention(nn.Module):
         if self.differential:
             q, q_diff = q.unbind(dim=1)
             k, k_diff = k.unbind(dim=1)
-            out      = optimized_attention(q,      k,      v, h, skip_reshape=True, low_precision_attention=False, transformer_options=transformer_options, **gqa_kwargs)
-            out_diff = optimized_attention(q_diff, k_diff, v, h, skip_reshape=True, low_precision_attention=False, transformer_options=transformer_options, **gqa_kwargs)
+            out      = self.optimized_attention(q,      k,      v, h, skip_reshape=True, low_precision_attention=False, transformer_options=transformer_options, **gqa_kwargs)
+            out_diff = self.optimized_attention(q_diff, k_diff, v, h, skip_reshape=True, low_precision_attention=False, transformer_options=transformer_options, **gqa_kwargs)
             out = out - out_diff
         else:
-            out = optimized_attention(q, k, v, h, skip_reshape=True, low_precision_attention=False, transformer_options=transformer_options, **gqa_kwargs)
+            out = self.optimized_attention(q, k, v, h, skip_reshape=True, low_precision_attention=False, transformer_options=transformer_options, **gqa_kwargs)
 
         out = self.to_out(out)
 
@@ -454,6 +455,7 @@ class Attention(nn.Module):
 class ConformerModule(nn.Module):
     def __init__(
         self,
+        device,
         dim,
         norm_kwargs = {},
     ):
@@ -462,11 +464,11 @@ class ConformerModule(nn.Module):
 
         self.dim = dim
 
-        self.in_norm = LayerNorm(dim, **norm_kwargs)
+        self.in_norm = LayerNorm(device, dim, **norm_kwargs)
         self.pointwise_conv = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
-        self.glu = GLU(dim, dim, nn.SiLU())
+        self.glu = GLU(device, dim, dim, nn.SiLU())
         self.depthwise_conv = nn.Conv1d(dim, dim, kernel_size=17, groups=dim, padding=8, bias=False)
-        self.mid_norm = LayerNorm(dim, **norm_kwargs) # This is a batch norm in the original but I don't like batch norm
+        self.mid_norm = LayerNorm(device, dim, **norm_kwargs) # This is a batch norm in the original but I don't like batch norm
         self.swish = nn.SiLU()
         self.pointwise_conv_2 = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
 
@@ -490,6 +492,7 @@ class ConformerModule(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(
             self,
+            device,
             dim,
             dim_heads = 64,
             cross_attend = False,
@@ -507,7 +510,6 @@ class TransformerBlock(nn.Module):
             ff_kwargs = {},
             norm_kwargs = {},
             dtype=None,
-            device=None,
             operations=None,
     ):
 
@@ -562,7 +564,7 @@ class TransformerBlock(nn.Module):
 
         self.layer_ix = layer_ix
 
-        self.conformer = ConformerModule(dim, norm_kwargs=norm_kwargs) if conformer else None
+        self.conformer = ConformerModule(device, dim, norm_kwargs=norm_kwargs) if conformer else None
 
         # Global conditioning
         self.has_global_cond = (global_cond_dim is not None) or global_cond_shared_embed
@@ -652,6 +654,7 @@ class TransformerBlock(nn.Module):
 class ContinuousTransformer(nn.Module):
     def __init__(
         self,
+        device,
         dim,
         depth,
         *,
@@ -672,7 +675,6 @@ class ContinuousTransformer(nn.Module):
         abs_pos_emb_max_length=10000,
         num_memory_tokens=0,
         dtype=None,
-        device=None,
         operations=None,
         **kwargs
         ):
@@ -821,6 +823,7 @@ class ContinuousTransformer(nn.Module):
 
 class AudioDiffusionTransformer(nn.Module):
     def __init__(self,
+        device,
         io_channels=64,
         patch_size=1,
         embed_dim=1536,
@@ -837,7 +840,6 @@ class AudioDiffusionTransformer(nn.Module):
         timestep_features_type: str = "learned",
         audio_model="",
         dtype=None,
-        device=None,
         operations=None,
         **kwargs):
 

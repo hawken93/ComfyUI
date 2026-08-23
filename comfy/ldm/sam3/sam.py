@@ -6,14 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.math import apply_rope
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ops import cast_to_input
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, sigmoid_output=False, device=None, dtype=None, operations=None):
+    def __init__(self, device, input_dim, hidden_dim, output_dim, num_layers, sigmoid_output=False, dtype=None, operations=None):
         super().__init__()
         dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
         self.layers = nn.ModuleList([operations.Linear(dims[i], dims[i + 1], device=device, dtype=dtype) for i in range(num_layers)])
@@ -26,7 +26,7 @@ class MLP(nn.Module):
 
 
 class SAMAttention(nn.Module):
-    def __init__(self, embedding_dim, num_heads, downsample_rate=1, kv_in_dim=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, embedding_dim, num_heads, downsample_rate=1, kv_in_dim=None, dtype=None, operations=None):
         super().__init__()
         self.num_heads = num_heads
         internal_dim = embedding_dim // downsample_rate
@@ -35,16 +35,17 @@ class SAMAttention(nn.Module):
         self.k_proj = operations.Linear(kv_dim, internal_dim, device=device, dtype=dtype)
         self.v_proj = operations.Linear(kv_dim, internal_dim, device=device, dtype=dtype)
         self.out_proj = operations.Linear(internal_dim, embedding_dim, device=device, dtype=dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, q, k, v):
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
-        return self.out_proj(optimized_attention(q, k, v, self.num_heads, low_precision_attention=False))
+        return self.out_proj(self.optimized_attention(q, k, v, self.num_heads, low_precision_attention=False))
 
 
 class TwoWayAttentionBlock(nn.Module):
-    def __init__(self, embedding_dim, num_heads, mlp_dim=2048, attention_downsample_rate=2, skip_first_layer_pe=False, device=None, dtype=None, operations=None):
+    def __init__(self, device, embedding_dim, num_heads, mlp_dim=2048, attention_downsample_rate=2, skip_first_layer_pe=False, dtype=None, operations=None):
         super().__init__()
         self.skip_first_layer_pe = skip_first_layer_pe
         self.self_attn = SAMAttention(embedding_dim, num_heads, device=device, dtype=dtype, operations=operations)
@@ -71,14 +72,14 @@ class TwoWayAttentionBlock(nn.Module):
 
 
 class TwoWayTransformer(nn.Module):
-    def __init__(self, depth=2, embedding_dim=256, num_heads=8, mlp_dim=2048, attention_downsample_rate=2, device=None, dtype=None, operations=None):
+    def __init__(self, device, depth=2, embedding_dim=256, num_heads=8, mlp_dim=2048, attention_downsample_rate=2, dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
-            TwoWayAttentionBlock(embedding_dim, num_heads, mlp_dim, attention_downsample_rate,
-                                 skip_first_layer_pe=(i == 0), device=device, dtype=dtype, operations=operations)
+            TwoWayAttentionBlock(device, embedding_dim, num_heads, mlp_dim, attention_downsample_rate,
+                                 skip_first_layer_pe=(i == 0), dtype=dtype, operations=operations)
             for i in range(depth)
         ])
-        self.final_attn_token_to_image = SAMAttention(embedding_dim, num_heads, downsample_rate=attention_downsample_rate, device=device, dtype=dtype, operations=operations)
+        self.final_attn_token_to_image = SAMAttention(device, embedding_dim, num_heads, downsample_rate=attention_downsample_rate, dtype=dtype, operations=operations)
         self.norm_final = operations.LayerNorm(embedding_dim, device=device, dtype=dtype)
 
     def forward(self, image_embedding, image_pe, point_embedding):
@@ -151,7 +152,7 @@ def rope_2d(end_x: int, end_y: int, dim: int, theta: float = 10000.0, scale_pos:
 
 
 class _ViTMLP(nn.Module):
-    def __init__(self, dim, mlp_ratio=4.0, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim, mlp_ratio=4.0, dtype=None, operations=None):
         super().__init__()
         hidden = int(dim * mlp_ratio)
         self.fc1 = operations.Linear(dim, hidden, device=device, dtype=dtype)
@@ -165,13 +166,14 @@ class _ViTMLP(nn.Module):
 class Attention(nn.Module):
     """ViTDet multi-head attention with fused QKV projection."""
 
-    def __init__(self, dim, num_heads=8, qkv_bias=True, use_rope=False, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim, num_heads=8, qkv_bias=True, use_rope=False, dtype=None, operations=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.use_rope = use_rope
         self.qkv = operations.Linear(dim, dim * 3, bias=qkv_bias, device=device, dtype=dtype)
         self.proj = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x, freqs_cis=None):
         B, N, C = x.shape
@@ -179,17 +181,17 @@ class Attention(nn.Module):
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
         if self.use_rope and freqs_cis is not None:
             q, k = apply_rope(q, k, freqs_cis)
-        return self.proj(optimized_attention(q, k, v, self.num_heads, skip_reshape=True, low_precision_attention=False))
+        return self.proj(self.optimized_attention(q, k, v, self.num_heads, skip_reshape=True, low_precision_attention=False))
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=True, window_size=0, use_rope=False, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim, num_heads, mlp_ratio=4.0, qkv_bias=True, window_size=0, use_rope=False, dtype=None, operations=None):
         super().__init__()
         self.window_size = window_size
         self.norm1 = operations.LayerNorm(dim, device=device, dtype=dtype)
-        self.attn = Attention(dim, num_heads, qkv_bias, use_rope, device=device, dtype=dtype, operations=operations)
+        self.attn = Attention(device, dim, num_heads, qkv_bias, use_rope, dtype=dtype, operations=operations)
         self.norm2 = operations.LayerNorm(dim, device=device, dtype=dtype)
-        self.mlp = _ViTMLP(dim, mlp_ratio, device=device, dtype=dtype, operations=operations)
+        self.mlp = _ViTMLP(device, dim, mlp_ratio, dtype=dtype, operations=operations)
 
     def forward(self, x, freqs_cis=None):
         shortcut = x
@@ -212,7 +214,7 @@ class Block(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, patch_size=14, in_chans=3, embed_dim=1024, device=None, dtype=None, operations=None):
+    def __init__(self, device, patch_size=14, in_chans=3, embed_dim=1024, dtype=None, operations=None):
         super().__init__()
         self.proj = operations.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=False, device=device, dtype=dtype)
 
@@ -221,8 +223,8 @@ class PatchEmbed(nn.Module):
 
 
 class ViTDet(nn.Module):
-    def __init__(self, img_size=1008, patch_size=14, embed_dim=1024, depth=32, num_heads=16, mlp_ratio=4.625, qkv_bias=True, window_size=24,
-                 global_att_blocks=(7, 15, 23, 31), use_rope=True, pretrain_img_size=336, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, img_size=1008, patch_size=14, embed_dim=1024, depth=32, num_heads=16, mlp_ratio=4.625, qkv_bias=True, window_size=24,
+                 global_att_blocks=(7, 15, 23, 31), use_rope=True, pretrain_img_size=336, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
@@ -230,7 +232,7 @@ class ViTDet(nn.Module):
         self.num_heads = num_heads
         self.global_att_blocks = set(global_att_blocks)
 
-        self.patch_embed = PatchEmbed(patch_size, 3, embed_dim, device=device, dtype=dtype, operations=operations)
+        self.patch_embed = PatchEmbed(device, patch_size, 3, embed_dim, dtype=dtype, operations=operations)
 
         num_patches = (pretrain_img_size // patch_size) ** 2 + 1  # +1 for cls token
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim, device=device, dtype=dtype))
@@ -244,10 +246,10 @@ class ViTDet(nn.Module):
         for i in range(depth):
             is_global = i in self.global_att_blocks
             self.blocks.append(Block(
-                embed_dim, num_heads, mlp_ratio, qkv_bias,
+                device, embed_dim, num_heads, mlp_ratio, qkv_bias,
                 window_size=0 if is_global else window_size,
                 use_rope=use_rope,
-                device=device, dtype=dtype, operations=operations,
+                dtype=dtype, operations=operations,
             ))
 
         if use_rope:
@@ -299,7 +301,7 @@ class ViTDet(nn.Module):
 
 
 class FPNScaleConv(nn.Module):
-    def __init__(self, in_dim, out_dim, scale, device=None, dtype=None, operations=None):
+    def __init__(self, device, in_dim, out_dim, scale, dtype=None, operations=None):
         super().__init__()
         if scale == 4.0:
             self.dconv_2x2_0 = operations.ConvTranspose2d(in_dim, in_dim // 2, kernel_size=2, stride=2, device=device, dtype=dtype)
@@ -375,22 +377,22 @@ class PositionEmbeddingSine(nn.Module):
 
 
 class SAM3VisionBackbone(nn.Module):
-    def __init__(self, embed_dim=1024, d_model=256, multiplex=False, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, embed_dim=1024, d_model=256, multiplex=False, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.trunk = ViTDet(embed_dim=embed_dim, device=device, dtype=dtype, operations=operations, **kwargs)
         self.position_encoding = PositionEmbeddingSine(num_pos_feats=d_model, normalize=True)
         self.multiplex = multiplex
 
-        fpn_args = dict(device=device, dtype=dtype, operations=operations)
+        fpn_args = dict(dtype=dtype, operations=operations)
         if multiplex:
             scales = [4.0, 2.0, 1.0]
-            self.convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
-            self.propagation_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
-            self.interactive_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.convs = nn.ModuleList([FPNScaleConv(device, embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.propagation_convs = nn.ModuleList([FPNScaleConv(device, embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.interactive_convs = nn.ModuleList([FPNScaleConv(device, embed_dim, d_model, s, **fpn_args) for s in scales])
         else:
             scales = [4.0, 2.0, 1.0, 0.5]
-            self.convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
-            self.sam2_convs = nn.ModuleList([FPNScaleConv(embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.convs = nn.ModuleList([FPNScaleConv(device, embed_dim, d_model, s, **fpn_args) for s in scales])
+            self.sam2_convs = nn.ModuleList([FPNScaleConv(device, embed_dim, d_model, s, **fpn_args) for s in scales])
 
     def forward(self, images, need_tracker=False, tracker_mode=None, cached_trunk=None, tracker_only=False):
         backbone_out = cached_trunk if cached_trunk is not None else self.trunk(images)

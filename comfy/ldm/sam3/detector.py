@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import roi_align
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.sam3.tracker import SAM3Tracker, SAM31Tracker
 from comfy.ldm.sam3.sam import SAM3VisionBackbone  # noqa: used in __init__
 from comfy.ldm.sam3.sam import MLP, PositionEmbeddingSine
@@ -35,13 +35,14 @@ def gen_sineembed_for_position(pos_tensor, num_feats=256):
 
 class SplitMHA(nn.Module):
     """Multi-head attention with separate Q/K/V projections (split from fused in_proj_weight)."""
-    def __init__(self, d_model, num_heads=8, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model, num_heads=8, dtype=None, operations=None):
         super().__init__()
         self.num_heads = num_heads
         self.q_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
         self.k_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
         self.v_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
         self.out_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, q_input, k_input=None, v_input=None, mask=None):
         q = self.q_proj(q_input)
@@ -54,13 +55,13 @@ class SplitMHA(nn.Module):
         if mask is not None and mask.ndim == 2:
             mask = mask[:, None, None, :]  # [B, T] -> [B, 1, 1, T] for SDPA broadcast
         dtype = q.dtype  # manual_cast may produce mixed dtypes
-        out = optimized_attention(q, k.to(dtype), v.to(dtype), self.num_heads, mask=mask, low_precision_attention=False)
+        out = self.optimized_attention(q, k.to(dtype), v.to(dtype), self.num_heads, mask=mask, low_precision_attention=False)
         return self.out_proj(out)
 
 
 class MLPWithNorm(nn.Module):
     """MLP with residual connection and output LayerNorm."""
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, residual=True, device=None, dtype=None, operations=None):
+    def __init__(self, device, input_dim, hidden_dim, output_dim, num_layers, residual=True, dtype=None, operations=None):
         super().__init__()
         dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
         self.layers = nn.ModuleList([
@@ -82,10 +83,10 @@ class MLPWithNorm(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, dim_ff=2048, dtype=None, operations=None):
         super().__init__()
-        self.self_attn = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
-        self.cross_attn_image = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.self_attn = SplitMHA(device, d_model, num_heads, dtype=dtype, operations=operations)
+        self.cross_attn_image = SplitMHA(device, d_model, num_heads, dtype=dtype, operations=operations)
         self.linear1 = operations.Linear(d_model, dim_ff, device=device, dtype=dtype)
         self.linear2 = operations.Linear(dim_ff, d_model, device=device, dtype=dtype)
         self.norm1 = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -106,10 +107,10 @@ class EncoderLayer(nn.Module):
 
 class TransformerEncoder(nn.Module):
     """Checkpoint: transformer.encoder.layers.N.*"""
-    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, num_layers=6, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, dim_ff=2048, num_layers=6, dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
-            EncoderLayer(d_model, num_heads, dim_ff, device=device, dtype=dtype, operations=operations)
+            EncoderLayer(device, d_model, num_heads, dim_ff, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
 
@@ -120,11 +121,11 @@ class TransformerEncoder(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, dim_ff=2048, dtype=None, operations=None):
         super().__init__()
-        self.self_attn = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
-        self.cross_attn = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
-        self.ca_text = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.self_attn = SplitMHA(device, d_model, num_heads, dtype=dtype, operations=operations)
+        self.cross_attn = SplitMHA(device, d_model, num_heads, dtype=dtype, operations=operations)
+        self.ca_text = SplitMHA(device, d_model, num_heads, dtype=dtype, operations=operations)
         self.norm1 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -143,14 +144,14 @@ class DecoderLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, num_layers=6,
-                 num_queries=200, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, dim_ff=2048, num_layers=6,
+                 num_queries=200, dtype=None, operations=None):
         super().__init__()
         self.d_model = d_model
         self.num_queries = num_queries
 
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model, num_heads, dim_ff, device=device, dtype=dtype, operations=operations)
+            DecoderLayer(device, d_model, num_heads, dim_ff, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -215,15 +216,15 @@ class TransformerDecoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, dim_ff=2048, enc_layers=6, dec_layers=6,
-                 num_queries=200, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, dim_ff=2048, enc_layers=6, dec_layers=6,
+                 num_queries=200, dtype=None, operations=None):
         super().__init__()
-        self.encoder = TransformerEncoder(d_model, num_heads, dim_ff, enc_layers, device=device, dtype=dtype, operations=operations)
-        self.decoder = TransformerDecoder(d_model, num_heads, dim_ff, dec_layers, num_queries, device=device, dtype=dtype, operations=operations)
+        self.encoder = TransformerEncoder(device, d_model, num_heads, dim_ff, enc_layers, dtype=dtype, operations=operations)
+        self.decoder = TransformerDecoder(device, d_model, num_heads, dim_ff, dec_layers, num_queries, dtype=dtype, operations=operations)
 
 
 class GeometryEncoder(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, num_layers=3, roi_size=7, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, num_layers=3, roi_size=7, dtype=None, operations=None):
         super().__init__()
         self.d_model = d_model
         self.roi_size = roi_size
@@ -239,7 +240,7 @@ class GeometryEncoder(nn.Module):
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.img_pre_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.encode = nn.ModuleList([
-            EncoderLayer(d_model, num_heads, 2048, device=device, dtype=dtype, operations=operations)
+            EncoderLayer(device, d_model, num_heads, 2048, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
         self.encode_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -313,7 +314,7 @@ class GeometryEncoder(nn.Module):
 
 class PixelDecoder(nn.Module):
     """Top-down FPN pixel decoder with GroupNorm + ReLU + nearest interpolation."""
-    def __init__(self, d_model=256, num_stages=3, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_stages=3, dtype=None, operations=None):
         super().__init__()
         self.conv_layers = nn.ModuleList([operations.Conv2d(d_model, d_model, kernel_size=3, padding=1, device=device, dtype=dtype) for _ in range(num_stages)])
         self.norms = nn.ModuleList([operations.GroupNorm(8, d_model, device=device, dtype=dtype) for _ in range(num_stages)])
@@ -326,7 +327,7 @@ class PixelDecoder(nn.Module):
 
 
 class MaskPredictor(nn.Module):
-    def __init__(self, d_model=256, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, dtype=None, operations=None):
         super().__init__()
         self.mask_embed = MLP(d_model, d_model, d_model, 3, device=device, dtype=dtype, operations=operations)
 
@@ -336,12 +337,12 @@ class MaskPredictor(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    def __init__(self, d_model=256, num_heads=8, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=8, dtype=None, operations=None):
         super().__init__()
         self.d_model = d_model
         self.pixel_decoder = PixelDecoder(d_model, 3, device=device, dtype=dtype, operations=operations)
-        self.mask_predictor = MaskPredictor(d_model, device=device, dtype=dtype, operations=operations)
-        self.cross_attend_prompt = SplitMHA(d_model, num_heads, device=device, dtype=dtype, operations=operations)
+        self.mask_predictor = MaskPredictor(device, d_model, dtype=dtype, operations=operations)
+        self.cross_attend_prompt = SplitMHA(device, d_model, num_heads, dtype=dtype, operations=operations)
         self.cross_attn_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.instance_seg_head = operations.Conv2d(d_model, d_model, kernel_size=1, device=device, dtype=dtype)
         self.semantic_seg_head = operations.Conv2d(d_model, 1, kernel_size=1, device=device, dtype=dtype)
@@ -365,11 +366,11 @@ class SegmentationHead(nn.Module):
 
 
 class DotProductScoring(nn.Module):
-    def __init__(self, d_model=256, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, dtype=None, operations=None):
         super().__init__()
         self.hs_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
         self.prompt_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.prompt_mlp = MLPWithNorm(d_model, 2048, d_model, 2, device=device, dtype=dtype, operations=operations)
+        self.prompt_mlp = MLPWithNorm(device, d_model, 2048, d_model, 2, dtype=dtype, operations=operations)
         self.scale = 1.0 / (d_model ** 0.5)
 
     def forward(self, query_embeddings, prompt_embeddings, prompt_mask=None):
@@ -386,7 +387,7 @@ class DotProductScoring(nn.Module):
 
 
 class SAM3Detector(nn.Module):
-    def __init__(self, d_model=256, embed_dim=1024, num_queries=200, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, d_model=256, embed_dim=1024, num_queries=200, dtype=None, operations=None, **kwargs):
         super().__init__()
         image_model = kwargs.pop("image_model", "SAM3")
         for k in ("num_heads", "num_head_channels"):
@@ -506,7 +507,7 @@ class SAM3Detector(nn.Module):
 
 
 class SAM3Model(nn.Module):
-    def __init__(self, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         image_model = kwargs.get("image_model", "SAM3")

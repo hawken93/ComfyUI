@@ -12,7 +12,7 @@ import comfy.ldm.flux.layers
 import comfy.patcher_extension
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 def _lens_time_proj(t: torch.Tensor, dim: int = 256) -> torch.Tensor:
@@ -55,7 +55,7 @@ def _lens_position_ids(
 
 
 class _TimestepEmbedder(nn.Module):
-    def __init__(self, in_channels: int, time_embed_dim: int, dtype=None, device=None, operations=None) -> None:
+    def __init__(self, device, in_channels: int, time_embed_dim: int, dtype=None, operations=None) -> None:
         super().__init__()
         self.linear_1 = operations.Linear(in_channels, time_embed_dim, dtype=dtype, device=device)
         self.linear_2 = operations.Linear(time_embed_dim, time_embed_dim, dtype=dtype, device=device)
@@ -67,7 +67,7 @@ class _TimestepEmbedder(nn.Module):
 
 
 class LensTimestepProjEmbeddings(nn.Module):
-    def __init__(self, embedding_dim: int, dtype=None, device=None, operations=None) -> None:
+    def __init__(self, device, embedding_dim: int, dtype=None, operations=None) -> None:
         super().__init__()
         self.timestep_embedder = _TimestepEmbedder(256, embedding_dim, dtype=dtype, device=device, operations=operations)
 
@@ -79,7 +79,7 @@ class LensTimestepProjEmbeddings(nn.Module):
 class GateMLP(nn.Module):
     """SwiGLU MLP."""
 
-    def __init__(self, dim: int, hidden_dim: int, dtype=None, device=None, operations=None) -> None:
+    def __init__(self, device, dim: int, hidden_dim: int, dtype=None, operations=None) -> None:
         super().__init__()
         self.w1 = operations.Linear(dim, hidden_dim, bias=False, dtype=dtype, device=device)
         self.w2 = operations.Linear(hidden_dim, dim, bias=False, dtype=dtype, device=device)
@@ -94,6 +94,7 @@ class LensJointAttention(nn.Module):
 
     def __init__(
         self,
+        device,
         query_dim: int,
         added_kv_proj_dim: int,
         dim_head: int = 64,
@@ -101,7 +102,6 @@ class LensJointAttention(nn.Module):
         out_dim: Optional[int] = None,
         eps: float = 1e-5,
         dtype=None,
-        device=None,
         operations=None,
     ) -> None:
         super().__init__()
@@ -124,6 +124,7 @@ class LensJointAttention(nn.Module):
             nn.Identity(),
         ])
         self.to_add_out = operations.Linear(self.inner_dim, query_dim, bias=True, dtype=dtype, device=device)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(
         self,
@@ -167,7 +168,7 @@ class LensJointAttention(nn.Module):
                 )
             attention_mask = attention_mask.to(q.dtype)
 
-        out = optimized_attention(
+        out = self.optimized_attention(
             q, k, v, self.heads, mask=attention_mask, skip_reshape=True,
             transformer_options=transformer_options,
         )
@@ -180,13 +181,13 @@ class LensJointAttention(nn.Module):
 class LensTransformerBlock(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         eps: float = 1e-6,
         rms_norm: bool = True,
         dtype=None,
-        device=None,
         operations=None,
     ) -> None:
         super().__init__()
@@ -276,8 +277,8 @@ class _AdaLayerNormContinuousNoAffine(nn.Module):
     to Flux's ``LastLayer``.
     """
 
-    def __init__(self, embedding_dim: int, conditioning_embedding_dim: int, eps: float = 1e-6,
-                 dtype=None, device=None, operations=None) -> None:
+    def __init__(self, device, embedding_dim: int, conditioning_embedding_dim: int, eps: float = 1e-6,
+                 dtype=None, operations=None) -> None:
         super().__init__()
         self.linear = operations.Linear(
             conditioning_embedding_dim, embedding_dim * 2, bias=True, dtype=dtype, device=device
@@ -297,6 +298,7 @@ class LensTransformer2DModel(nn.Module):
 
     def __init__(
         self,
+        device,
         patch_size: int = 2,
         in_channels: int = 128,
         out_channels: Optional[int] = 32,
@@ -310,7 +312,6 @@ class LensTransformer2DModel(nn.Module):
         selected_layer_index: Tuple[int, ...] = (5, 11, 17, 23),
         image_model=None,  # unused; accepted for detection-side configs.
         dtype=None,
-        device=None,
         operations=None,
     ) -> None:
         super().__init__()

@@ -576,7 +576,7 @@ class VAE:
                 self.downscale_ratio = 32
                 self.latent_channels = 16
             elif "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd: # seedvr2
-                self.first_stage_model = comfy.ldm.seedvr.vae.VideoAutoencoderKLWrapper()
+                self.first_stage_model = comfy.ldm.seedvr.vae.VideoAutoencoderKLWrapper(model_management.vae_device())
                 self.latent_channels = comfy.ldm.seedvr.vae.SEEDVR2_LATENT_CHANNELS
                 self.latent_dim = 3
                 self.disable_offload = True
@@ -713,7 +713,7 @@ class VAE:
                     sd = comfy.utils.state_dict_prefix_replace(sd, {"": "decoder."})
                 if "layers.4.layers.1.attn_block.attn.qkv.weight" in sd:
                     sd = comfy.utils.state_dict_prefix_replace(sd, {"": "encoder."})
-                self.first_stage_model = comfy.ldm.genmo.vae.model.VideoVAE()
+                self.first_stage_model = comfy.ldm.genmo.vae.model.VideoVAE(model_management.vae_device())
                 self.latent_channels = 12
                 self.latent_dim = 3
                 self.memory_used_decode = lambda shape, dtype: (1000 * shape[2] * shape[3] * shape[4] * (6 * 8 * 8)) * model_management.dtype_size(dtype)
