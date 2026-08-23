@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 import comfy.patcher_extension
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.modules.diffusionmodules.mmdit import TimestepEmbedder
 from comfy.text_encoders.llama import Llama2_
 from comfy.text_encoders.qwen35 import Qwen35VisionModel
@@ -126,6 +127,11 @@ class HiDreamO1Transformer(nn.Module):
             out_channels=self.in_channels, device=device, dtype=dtype, ops=operations,
         )
 
+        # Per-device attention backend, resolved once at init (replaces the deleted
+        # module-level optimized_attention global). ar_len/transformer_options vary
+        # per step and are supplied when the callable is built in _forward.
+        self.optimized_attention = optimized_attention_for_device(device)
+
         self._visual_cache = None
         self._kv_cache_entries = []
 
@@ -197,7 +203,7 @@ class HiDreamO1Transformer(nn.Module):
         freqs_cis = self.language_model.compute_freqs_cis(position_ids[0].to(x.device), x.device)
         freqs_cis = tuple(t.to(x.dtype) for t in freqs_cis)
 
-        two_pass_attn = make_two_pass_attention(ar_len, transformer_options=transformer_options)
+        two_pass_attn = make_two_pass_attention(ar_len, self.optimized_attention, transformer_options=transformer_options)
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.language_model.layers)

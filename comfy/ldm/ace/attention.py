@@ -19,12 +19,13 @@ import torch.nn.functional as F
 from torch import nn
 
 import comfy.model_management
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 class Attention(nn.Module):
     def __init__(
         self,
         query_dim: int,
+        device,
         cross_attention_dim: Optional[int] = None,
         heads: int = 8,
         kv_heads: Optional[int] = None,
@@ -47,7 +48,7 @@ class Attention(nn.Module):
         pre_only=False,
         elementwise_affine: bool = True,
         is_causal: bool = False,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
 
@@ -329,6 +330,9 @@ class CustomerAttnProcessor2_0:
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
     """
 
+    def __init__(self, device, operations=None):
+        self.optimized_attention = optimized_attention_for_device(device)
+
     def apply_rotary_emb(
         self,
         x: torch.Tensor,
@@ -435,7 +439,7 @@ class CustomerAttnProcessor2_0:
             attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        hidden_states = optimized_attention(
+        hidden_states = self.optimized_attention(
             query, key, value, heads=query.shape[1], mask=attention_mask, skip_reshape=True, transformer_options=transformer_options,
         ).to(query.dtype)
 
@@ -489,6 +493,7 @@ class ConvLayer(nn.Module):
         self,
         in_dim: int,
         out_dim: int,
+        device,
         kernel_size=3,
         stride=1,
         dilation=1,
@@ -497,7 +502,7 @@ class ConvLayer(nn.Module):
         use_bias=False,
         norm=None,
         act=None,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
         if padding is None:
@@ -548,6 +553,7 @@ class GLUMBConv(nn.Module):
         self,
         in_features: int,
         hidden_features: int,
+        device,
         out_feature=None,
         kernel_size=3,
         stride=1,
@@ -556,7 +562,7 @@ class GLUMBConv(nn.Module):
         norm=(None, None, None),
         act=("silu", "silu", None),
         dilation=1,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
     ):
         out_feature = out_feature or in_features
         super().__init__()
@@ -568,7 +574,7 @@ class GLUMBConv(nn.Module):
         self.inverted_conv = ConvLayer(
             in_features,
             hidden_features * 2,
-            1,
+            kernel_size=1,
             use_bias=use_bias[0],
             norm=norm[0],
             act=act[0],
@@ -594,7 +600,7 @@ class GLUMBConv(nn.Module):
         self.point_conv = ConvLayer(
             hidden_features,
             out_feature,
-            1,
+            kernel_size=1,
             use_bias=use_bias[2],
             norm=norm[2],
             act=act[2],
@@ -627,6 +633,7 @@ class LinearTransformerBlock(nn.Module):
         dim,
         num_attention_heads,
         attention_head_dim,
+        device,
         use_adaln_single=True,
         cross_attention_dim=None,
         added_kv_proj_dim=None,
@@ -635,7 +642,7 @@ class LinearTransformerBlock(nn.Module):
         add_cross_attention=False,
         add_cross_attention_dim=None,
         qk_norm=None,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
 
@@ -669,7 +676,7 @@ class LinearTransformerBlock(nn.Module):
                 context_pre_only=context_pre_only,
                 bias=True,
                 qk_norm=qk_norm,
-                processor=CustomerAttnProcessor2_0(),
+                processor=CustomerAttnProcessor2_0(device=device, operations=operations),
                 dtype=dtype,
                 device=device,
                 operations=operations,

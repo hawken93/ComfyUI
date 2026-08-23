@@ -46,7 +46,7 @@ class ChromaRadiance(Chroma):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, image_model=None, final_layer=True, dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, device, image_model=None, final_layer=True, dtype=None, operations=None, **kwargs):
         if operations is None:
             raise RuntimeError("Attempt to create ChromaRadiance object without setting operations")
         nn.Module.__init__(self)
@@ -92,12 +92,13 @@ class ChromaRadiance(Chroma):
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
+                    device,
                     self.hidden_size,
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
                     modulation=False,
-                    dtype=dtype, device=device, operations=operations
+                    dtype=dtype, operations=operations
                 )
                 for _ in range(params.depth)
             ]
@@ -106,11 +107,12 @@ class ChromaRadiance(Chroma):
         self.single_blocks = nn.ModuleList(
             [
                 SingleStreamBlock(
+                    device,
                     self.hidden_size,
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     modulation=False,
-                    dtype=dtype, device=device, operations=operations,
+                    dtype=dtype, operations=operations,
                 )
                 for _ in range(params.depth_single_blocks)
             ]

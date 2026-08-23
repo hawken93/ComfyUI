@@ -865,7 +865,8 @@ class VAELoader:
 class ControlNetLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "control_net_name": (folder_paths.get_filename_list("controlnet"), )}}
+        return {"required": { "control_net_name": (folder_paths.get_filename_list("controlnet"), )},
+                "optional": { "device": (comfy.model_management.get_gpu_device_options(), {"advanced": True}) }}
 
     RETURN_TYPES = ("CONTROL_NET",)
     FUNCTION = "load_controlnet"
@@ -873,9 +874,9 @@ class ControlNetLoader:
     CATEGORY = "model/loaders"
     SEARCH_ALIASES = ["controlnet", "control net", "cn", "load controlnet", "controlnet loader"]
 
-    def load_controlnet(self, control_net_name):
+    def load_controlnet(self, control_net_name, device="default"):
         controlnet_path = folder_paths.get_full_path_or_raise("controlnet", control_net_name)
-        controlnet = comfy.controlnet.load_controlnet(controlnet_path)
+        controlnet = comfy.controlnet.load_controlnet(controlnet_path, comfy.model_management.pick_device_for_option(device))
         if controlnet is None:
             raise RuntimeError("ERROR: controlnet file is invalid and does not contain a valid controlnet model.")
         return (controlnet,)
@@ -893,7 +894,7 @@ class DiffControlNetLoader:
 
     def load_controlnet(self, model, control_net_name):
         controlnet_path = folder_paths.get_full_path_or_raise("controlnet", control_net_name)
-        controlnet = comfy.controlnet.load_controlnet(controlnet_path, model)
+        controlnet = comfy.controlnet.load_controlnet(controlnet_path, model.load_device, model)
         return (controlnet,)
 
 

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from comfy.ldm.flux.math import apply_rope, rope
 from comfy.ldm.flux.layers import LastLayer
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.ldm.common_dit
@@ -36,10 +36,12 @@ class EmbedND(nn.Module):
 class PatchEmbed(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
+        dtype=None,
         patch_size=2,
         in_channels=4,
-        out_channels=1024,
-        dtype=None, device=None, operations=None
+        out_channels=1024
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -52,7 +54,7 @@ class PatchEmbed(nn.Module):
 
 
 class PooledEmbed(nn.Module):
-    def __init__(self, text_emb_dim, hidden_size, dtype=None, device=None, operations=None):
+    def __init__(self, text_emb_dim, hidden_size, device, operations, dtype=None):
         super().__init__()
         self.pooled_embedder = TimestepEmbedding(in_channels=text_emb_dim, time_embed_dim=hidden_size, dtype=dtype, device=device, operations=operations)
 
@@ -61,7 +63,7 @@ class PooledEmbed(nn.Module):
 
 
 class TimestepEmbed(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=None):
+    def __init__(self, hidden_size, device, operations, dtype=None, frequency_embedding_size=256):
         super().__init__()
         self.time_proj = Timesteps(num_channels=frequency_embedding_size, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(in_channels=frequency_embedding_size, time_embed_dim=hidden_size, dtype=dtype, device=device, operations=operations)
@@ -72,7 +74,7 @@ class TimestepEmbed(nn.Module):
         return t_emb
 
 
-def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, transformer_options={}):
+def attention(optimized_attention, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, transformer_options={}):
     return optimized_attention(query.view(query.shape[0], -1, query.shape[-1] * query.shape[-2]), key.view(key.shape[0], -1, key.shape[-1] * key.shape[-2]), value.view(value.shape[0], -1, value.shape[-1] * value.shape[-2]), query.shape[2], transformer_options=transformer_options)
 
 
@@ -134,7 +136,7 @@ class HiDreamAttnProcessor_flashattn:
             query = torch.cat([query_1, query_2], dim=-1)
             key = torch.cat([key_1, key_2], dim=-1)
 
-        hidden_states = attention(query, key, value, transformer_options=transformer_options)
+        hidden_states = attention(attn.optimized_attention, query, key, value, transformer_options=transformer_options)
 
         if not attn.single:
             hidden_states_i, hidden_states_t = torch.split(hidden_states, [num_image_tokens, num_text_tokens], dim=1)
@@ -148,6 +150,8 @@ class HiDreamAttnProcessor_flashattn:
 class HiDreamAttention(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -158,10 +162,11 @@ class HiDreamAttention(nn.Module):
         processor = None,
         out_dim: int = None,
         single: bool = False,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         # super(Attention, self).__init__()
         super().__init__()
+        self.optimized_attention = optimized_attention_for_device(device)
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
         self.upcast_attention = upcast_attention
@@ -215,11 +220,13 @@ class HiDreamAttention(nn.Module):
 class FeedForwardSwiGLU(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         hidden_dim: int,
         multiple_of: int = 256,
         ffn_dim_multiplier: Optional[float] = None,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -240,7 +247,7 @@ class FeedForwardSwiGLU(nn.Module):
 
 # Modified from https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 class MoEGate(nn.Module):
-    def __init__(self, embed_dim, num_routed_experts=4, num_activated_experts=2, aux_loss_alpha=0.01, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, embed_dim, num_routed_experts=4, num_activated_experts=2, aux_loss_alpha=0.01, dtype=None):
         super().__init__()
         self.top_k = num_activated_experts
         self.n_routed_experts = num_routed_experts
@@ -291,7 +298,7 @@ class MOEFeedForwardSwiGLU(nn.Module):
         hidden_dim: int,
         num_routed_experts: int,
         num_activated_experts: int,
-        dtype=None, device=None, operations=None
+        device, operations, dtype=None
     ):
         super().__init__()
         self.shared_experts = FeedForwardSwiGLU(dim, hidden_dim // 2, dtype=dtype, device=device, operations=operations)
@@ -347,7 +354,7 @@ class MOEFeedForwardSwiGLU(nn.Module):
 
 
 class TextProjection(nn.Module):
-    def __init__(self, in_features, hidden_size, dtype=None, device=None, operations=None):
+    def __init__(self, in_features, hidden_size, device, operations, dtype=None):
         super().__init__()
         self.linear = operations.Linear(in_features=in_features, out_features=hidden_size, bias=False, dtype=dtype, device=device)
 
@@ -364,12 +371,14 @@ class BlockType:
 class HiDreamImageSingleTransformerBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         num_routed_experts: int = 4,
         num_activated_experts: int = 2,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -437,12 +446,14 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
 class HiDreamImageTransformerBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         num_routed_experts: int = 4,
         num_activated_experts: int = 2,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -527,13 +538,15 @@ class HiDreamImageTransformerBlock(nn.Module):
 class HiDreamImageBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         num_routed_experts: int = 4,
         num_activated_experts: int = 2,
         block_type: BlockType = BlockType.TransformerBlock,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
         block_classes = {
@@ -571,6 +584,9 @@ class HiDreamImageBlock(nn.Module):
 class HiDreamImageTransformer2DModel(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
+        dtype=None,
         patch_size: Optional[int] = None,
         in_channels: int = 64,
         out_channels: Optional[int] = None,
@@ -585,8 +601,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
         axes_dims_rope: Tuple[int, int] = (32, 32),
         max_resolution: Tuple[int, int] = (128, 128),
         llama_layers: List[int] = None,
-        image_model=None,
-        dtype=None, device=None, operations=None
+        image_model=None
     ):
         self.patch_size = patch_size
         self.num_attention_heads = num_attention_heads

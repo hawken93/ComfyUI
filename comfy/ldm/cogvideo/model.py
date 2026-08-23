@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.patcher_extension
 import comfy.ldm.common_dit
 
@@ -100,13 +100,13 @@ def _get_1d_sincos_pos_embed(embed_dim, pos, device=None):
 
 
 class CogVideoXPatchEmbed(nn.Module):
-    def __init__(self, patch_size=2, patch_size_t=None, in_channels=16, dim=1920,
+    def __init__(self, device, patch_size=2, patch_size_t=None, in_channels=16, dim=1920,
                  text_dim=4096, bias=True, sample_width=90, sample_height=60,
                  sample_frames=49, temporal_compression_ratio=4,
                  max_text_seq_length=226, spatial_interpolation_scale=1.875,
                  temporal_interpolation_scale=1.0, use_positional_embeddings=True,
                  use_learned_positional_embeddings=True,
-                 device=None, dtype=None, operations=None):
+                 dtype=None, operations=None):
         super().__init__()
         self.patch_size = patch_size
         self.patch_size_t = patch_size_t
@@ -207,8 +207,8 @@ class CogVideoXPatchEmbed(nn.Module):
 
 
 class CogVideoXLayerNormZero(nn.Module):
-    def __init__(self, time_dim, dim, elementwise_affine=True, eps=1e-5, bias=True,
-                 device=None, dtype=None, operations=None):
+    def __init__(self, device, time_dim, dim, elementwise_affine=True, eps=1e-5, bias=True,
+                 dtype=None, operations=None):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear = operations.Linear(time_dim, 6 * dim, bias=bias, device=device, dtype=dtype)
@@ -222,8 +222,8 @@ class CogVideoXLayerNormZero(nn.Module):
 
 
 class CogVideoXAdaLayerNorm(nn.Module):
-    def __init__(self, time_dim, dim, elementwise_affine=True, eps=1e-5,
-                 device=None, dtype=None, operations=None):
+    def __init__(self, device, time_dim, dim, elementwise_affine=True, eps=1e-5,
+                 dtype=None, operations=None):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear = operations.Linear(time_dim, 2 * dim, device=device, dtype=dtype)
@@ -237,15 +237,16 @@ class CogVideoXAdaLayerNorm(nn.Module):
 
 
 class CogVideoXBlock(nn.Module):
-    def __init__(self, dim, num_heads, head_dim, time_dim,
+    def __init__(self, device, dim, num_heads, head_dim, time_dim,
                  eps=1e-5, ff_inner_dim=None, ff_bias=True,
-                 device=None, dtype=None, operations=None):
+                 dtype=None, operations=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.optimized_attention = optimized_attention_for_device(device)
 
-        self.norm1 = CogVideoXLayerNormZero(time_dim, dim, eps=eps, device=device, dtype=dtype, operations=operations)
+        self.norm1 = CogVideoXLayerNormZero(device, time_dim, dim, eps=eps, dtype=dtype, operations=operations)
 
         # Self-attention (joint text + latent)
         self.q = operations.Linear(dim, dim, bias=True, device=device, dtype=dtype)
@@ -255,7 +256,7 @@ class CogVideoXBlock(nn.Module):
         self.norm_k = operations.LayerNorm(head_dim, eps=1e-6, elementwise_affine=True, device=device, dtype=dtype)
         self.attn_out = operations.Linear(dim, dim, bias=True, device=device, dtype=dtype)
 
-        self.norm2 = CogVideoXLayerNormZero(time_dim, dim, eps=eps, device=device, dtype=dtype, operations=operations)
+        self.norm2 = CogVideoXLayerNormZero(device, time_dim, dim, eps=eps, dtype=dtype, operations=operations)
 
         # Feed-forward (GELU approximate)
         inner_dim = ff_inner_dim or dim * 4
@@ -291,7 +292,7 @@ class CogVideoXBlock(nn.Module):
             q = torch.cat([q[:, :text_seq_length], q_img.transpose(1, 2)], dim=1)
             k = torch.cat([k[:, :text_seq_length], k_img.transpose(1, 2)], dim=1)
 
-        attn_out = optimized_attention(
+        attn_out = self.optimized_attention(
             q.reshape(b, s, n * d),
             k.reshape(b, s, n * d),
             v,
@@ -320,7 +321,7 @@ class CogVideoXBlock(nn.Module):
 
 
 class CogVideoXTransformer3DModel(nn.Module):
-    def __init__(self,
+    def __init__(self, device,
                  num_attention_heads=30,
                  attention_head_dim=64,
                  in_channels=16,
@@ -346,7 +347,6 @@ class CogVideoXTransformer3DModel(nn.Module):
                  use_learned_positional_embeddings=False,
                  patch_bias=True,
                  image_model=None,
-                 device=None,
                  dtype=None,
                  operations=None,
                  ):

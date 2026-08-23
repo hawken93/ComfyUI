@@ -7,14 +7,13 @@ gen half hit the user's preferred backend via optimized_attention.
 import torch
 
 import comfy.ops
-from comfy.ldm.modules.attention import optimized_attention
 
 
-def make_two_pass_attention(ar_len: int, transformer_options=None):
+def make_two_pass_attention(ar_len: int, optimized_attention, transformer_options=None):
     """Build a two-pass attention callable. AR pass uses SDPA-causal directly, gen pass routes through optimized_attention.
     The AR pass goes through SDPA directand bypasses wrappers, it is only ~1% of T at typical edit sizes.
+    `optimized_attention` is the per-device callable resolved once at model init; it is not re-derived here.
     """
-
     def two_pass_attention(q, k, v, heads, enable_gqa=False, **kwargs):
         B, H, T, D = q.shape
 

@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 # from flash_attn import flash_attn_varlen_qkvpacked_func
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 from .layers import (
     FeedForward,
@@ -55,6 +55,7 @@ class AsymmetricAttention(nn.Module):
         self,
         dim_x: int,
         dim_y: int,
+        device,
         num_heads: int = 8,
         qkv_bias: bool = True,
         qk_norm: bool = False,
@@ -63,7 +64,6 @@ class AsymmetricAttention(nn.Module):
         out_bias: bool = True,
         attend_to_padding: bool = False,
         softmax_scale: Optional[float] = None,
-        device: Optional[torch.device] = None,
         dtype=None,
         operations=None,
     ):
@@ -76,6 +76,7 @@ class AsymmetricAttention(nn.Module):
         self.update_y = update_y
         self.attend_to_padding = attend_to_padding
         self.softmax_scale = softmax_scale
+        self.optimized_attention = optimized_attention_for_device(device)
         if dim_x % num_heads != 0:
             raise ValueError(
                 f"dim_x={dim_x} should be divisible by num_heads={num_heads}"
@@ -142,7 +143,7 @@ class AsymmetricAttention(nn.Module):
         k = torch.cat([k_x, k_y[:, :crop_y]], dim=1).transpose(1, 2)
         v = torch.cat([v_x, v_y[:, :crop_y]], dim=1).transpose(1, 2)
 
-        xy = optimized_attention(q,
+        xy = self.optimized_attention(q,
                                  k,
                                  v, self.num_heads, skip_reshape=True, transformer_options=transformer_options)
 
@@ -160,6 +161,7 @@ class AsymmetricAttention(nn.Module):
 class AsymmetricJointBlock(nn.Module):
     def __init__(
         self,
+        device,
         hidden_size_x: int,
         hidden_size_y: int,
         num_heads: int,
@@ -167,7 +169,6 @@ class AsymmetricJointBlock(nn.Module):
         mlp_ratio_x: float = 8.0,  # Ratio of hidden size to d_model for MLP for visual tokens.
         mlp_ratio_y: float = 4.0,  # Ratio of hidden size to d_model for MLP for text tokens.
         update_y: bool = True,  # Whether to update text tokens in this block.
-        device: Optional[torch.device] = None,
         dtype=None,
         operations=None,
         **block_kwargs,
@@ -297,7 +298,7 @@ class FinalLayer(nn.Module):
         hidden_size,
         patch_size,
         out_channels,
-        device: Optional[torch.device] = None,
+        device,
         dtype=None,
         operations=None,
     ):
@@ -327,6 +328,7 @@ class AsymmDiTJoint(nn.Module):
 
     def __init__(
         self,
+        device,
         *,
         patch_size=2,
         in_channels=4,
@@ -348,7 +350,6 @@ class AsymmDiTJoint(nn.Module):
         posenc_preserve_area: bool = False,
         rope_theta: float = 10000.0,
         image_model=None,
-        device: Optional[torch.device] = None,
         dtype=None,
         operations=None,
         **block_kwargs,

@@ -65,7 +65,7 @@ class Flux(nn.Module):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, image_model=None, final_layer=True, dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, device, image_model=None, final_layer=True, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         params = FluxParams(**kwargs)
@@ -103,6 +103,7 @@ class Flux(nn.Module):
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
+                    device,
                     self.hidden_size,
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
@@ -111,7 +112,7 @@ class Flux(nn.Module):
                     mlp_silu_act=params.mlp_silu_act,
                     proj_bias=params.ops_bias,
                     yak_mlp=params.yak_mlp,
-                    dtype=dtype, device=device, operations=operations
+                    dtype=dtype, operations=operations
                 )
                 for _ in range(params.depth)
             ]
@@ -119,7 +120,7 @@ class Flux(nn.Module):
 
         self.single_blocks = nn.ModuleList(
             [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, modulation=params.global_modulation is False, mlp_silu_act=params.mlp_silu_act, bias=params.ops_bias, yak_mlp=params.yak_mlp, dtype=dtype, device=device, operations=operations)
+                SingleStreamBlock(device, self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, modulation=params.global_modulation is False, mlp_silu_act=params.mlp_silu_act, bias=params.ops_bias, yak_mlp=params.yak_mlp, dtype=dtype, operations=operations)
                 for _ in range(params.depth_single_blocks)
             ]
         )

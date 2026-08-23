@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import itertools
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 from comfy.ldm.flux.layers import timestep_embedding
 
@@ -74,7 +74,7 @@ def get_layer_class(operations, layer_name):
     return getattr(nn, layer_name)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=32768, base=1000000.0, dtype=None, device=None, operations=None):
+    def __init__(self, dim, device, max_position_embeddings=32768, base=1000000.0, dtype=None, operations=None):
         super().__init__()
         self.dim = dim
         self.base = base
@@ -113,7 +113,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 class MLP(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, dtype=None, device=None, operations=None):
+    def __init__(self, hidden_size, intermediate_size, device, dtype=None, operations=None):
         super().__init__()
         Linear = get_layer_class(operations, "Linear")
         self.gate_proj = Linear(hidden_size, intermediate_size, bias=False, dtype=dtype, device=device)
@@ -125,7 +125,7 @@ class MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, in_channels: int, time_embed_dim: int, scale: float = 1000, dtype=None, device=None, operations=None):
+    def __init__(self, in_channels: int, time_embed_dim: int, device, scale: float = 1000, dtype=None, operations=None):
         super().__init__()
         Linear = get_layer_class(operations, "Linear")
         self.linear_1 = Linear(in_channels, time_embed_dim, bias=True, dtype=dtype, device=device)
@@ -151,11 +151,11 @@ class AceStepAttention(nn.Module):
         num_heads,
         num_kv_heads,
         head_dim,
+        device,
         rms_norm_eps=1e-6,
         is_cross_attention=False,
         sliding_window=None,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -175,6 +175,8 @@ class AceStepAttention(nn.Module):
 
         self.q_norm = operations.RMSNorm(head_dim, eps=rms_norm_eps, dtype=dtype, device=device)
         self.k_norm = operations.RMSNorm(head_dim, eps=rms_norm_eps, dtype=dtype, device=device)
+
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(
         self,
@@ -241,7 +243,7 @@ class AceStepAttention(nn.Module):
             else:
                 attn_bias = window_bias
 
-        attn_output = optimized_attention(query_states, key_states, value_states, self.num_heads, attn_bias, skip_reshape=True, low_precision_attention=False, **gqa_kwargs)
+        attn_output = self.optimized_attention(query_states, key_states, value_states, self.num_heads, attn_bias, skip_reshape=True, low_precision_attention=False, **gqa_kwargs)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -254,11 +256,11 @@ class AceStepDiTLayer(nn.Module):
         num_kv_heads,
         head_dim,
         intermediate_size,
+        device,
         rms_norm_eps=1e-6,
         layer_type="full_attention",
         sliding_window=128,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -267,15 +269,15 @@ class AceStepDiTLayer(nn.Module):
 
         self.self_attn_norm = operations.RMSNorm(hidden_size, eps=rms_norm_eps, dtype=dtype, device=device)
         self.self_attn = AceStepAttention(
-            hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps,
-            is_cross_attention=False, sliding_window=self_attn_window,
-            dtype=dtype, device=device, operations=operations
+            hidden_size, num_heads, num_kv_heads, head_dim, device,
+            is_cross_attention=False, sliding_window=self_attn_window, rms_norm_eps=rms_norm_eps,
+            dtype=dtype, operations=operations
         )
 
         self.cross_attn_norm = operations.RMSNorm(hidden_size, eps=rms_norm_eps, dtype=dtype, device=device)
         self.cross_attn = AceStepAttention(
-            hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps,
-            is_cross_attention=True, dtype=dtype, device=device, operations=operations
+            hidden_size, num_heads, num_kv_heads, head_dim, device,
+            is_cross_attention=True, rms_norm_eps=rms_norm_eps, dtype=dtype, operations=operations
         )
 
         self.mlp_norm = operations.RMSNorm(hidden_size, eps=rms_norm_eps, dtype=dtype, device=device)
@@ -329,15 +331,15 @@ class AceStepEncoderLayer(nn.Module):
         num_kv_heads,
         head_dim,
         intermediate_size,
+        device,
         rms_norm_eps=1e-6,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
         self.self_attn = AceStepAttention(
-            hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps,
-            is_cross_attention=False, dtype=dtype, device=device, operations=operations
+            hidden_size, num_heads, num_kv_heads, head_dim, device,
+            is_cross_attention=False, rms_norm_eps=rms_norm_eps, dtype=dtype, operations=operations
         )
         self.input_layernorm = operations.RMSNorm(hidden_size, eps=rms_norm_eps, dtype=dtype, device=device)
         self.post_attention_layernorm = operations.RMSNorm(hidden_size, eps=rms_norm_eps, dtype=dtype, device=device)
@@ -369,9 +371,9 @@ class AceStepLyricEncoder(nn.Module):
         num_kv_heads,
         head_dim,
         intermediate_size,
+        device,
         rms_norm_eps=1e-6,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -389,8 +391,8 @@ class AceStepLyricEncoder(nn.Module):
 
         self.layers = nn.ModuleList([
             AceStepEncoderLayer(
-                hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, rms_norm_eps,
-                dtype=dtype, device=device, operations=operations
+                hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, device,
+                rms_norm_eps=rms_norm_eps, dtype=dtype, operations=operations
             )
             for _ in range(num_layers)
         ])
@@ -421,9 +423,9 @@ class AceStepTimbreEncoder(nn.Module):
         num_kv_heads,
         head_dim,
         intermediate_size,
+        device,
         rms_norm_eps=1e-6,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -441,8 +443,8 @@ class AceStepTimbreEncoder(nn.Module):
 
         self.layers = nn.ModuleList([
             AceStepEncoderLayer(
-                hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, rms_norm_eps,
-                dtype=dtype, device=device, operations=operations
+                hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, device,
+                rms_norm_eps=rms_norm_eps, dtype=dtype, operations=operations
             )
             for _ in range(num_layers)
         ])
@@ -529,9 +531,9 @@ class AceStepConditionEncoder(nn.Module):
         num_kv_heads,
         head_dim,
         intermediate_size,
+        device,
         rms_norm_eps=1e-6,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -608,12 +610,12 @@ class AceStepDiTModel(nn.Module):
         intermediate_size,
         patch_size,
         audio_acoustic_hidden_dim,
+        device,
         condition_dim=None,
         layer_types=None,
         sliding_window=128,
         rms_norm_eps=1e-6,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -648,8 +650,8 @@ class AceStepDiTModel(nn.Module):
 
         self.layers = nn.ModuleList([
             AceStepDiTLayer(
-                hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, rms_norm_eps,
-                layer_type=layer_types[i],
+                hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, device,
+                layer_type=layer_types[i], rms_norm_eps=rms_norm_eps,
                 sliding_window=sliding_window,
                 dtype=dtype, device=device, operations=operations
             ) for i in range(num_layers)
@@ -717,7 +719,7 @@ class AceStepDiTModel(nn.Module):
 
 
 class AttentionPooler(nn.Module):
-    def __init__(self, hidden_size, num_layers, head_dim, rms_norm_eps, dtype=None, device=None, operations=None):
+    def __init__(self, hidden_size, num_layers, head_dim, rms_norm_eps, device, dtype=None, operations=None):
         super().__init__()
         Linear = get_layer_class(operations, "Linear")
         self.embed_tokens = Linear(hidden_size, hidden_size, dtype=dtype, device=device)
@@ -727,8 +729,8 @@ class AttentionPooler(nn.Module):
 
         self.layers = nn.ModuleList([
             AceStepEncoderLayer(
-                hidden_size, 16, 8, head_dim, hidden_size * 3, rms_norm_eps,
-                dtype=dtype, device=device, operations=operations
+                hidden_size, 16, 8, head_dim, hidden_size * 3, device,
+                rms_norm_eps=rms_norm_eps, dtype=dtype, operations=operations
             )
             for _ in range(num_layers)
         ])
@@ -752,8 +754,8 @@ class FSQ(nn.Module):
     def __init__(
         self,
         levels,
+        device,
         dim=None,
-        device=None,
         dtype=None,
         operations=None
     ):
@@ -821,9 +823,9 @@ class ResidualFSQ(nn.Module):
         self,
         levels,
         num_quantizers,
+        device,
         dim=None,
         bound_hard_clamp=True,
-        device=None,
         dtype=None,
         operations=None,
         **kwargs
@@ -920,8 +922,8 @@ class AceStepAudioTokenizer(nn.Module):
         num_layers,
         head_dim,
         rms_norm_eps,
+        device,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -970,8 +972,8 @@ class AudioTokenDetokenizer(nn.Module):
         audio_acoustic_hidden_dim,
         num_layers,
         head_dim,
+        device,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -982,8 +984,8 @@ class AudioTokenDetokenizer(nn.Module):
         self.rotary_emb = RotaryEmbedding(head_dim, dtype=dtype, device=device, operations=operations)
         self.layers = nn.ModuleList([
             AceStepEncoderLayer(
-                hidden_size, 16, 8, head_dim, hidden_size * 3, 1e-6,
-                dtype=dtype, device=device, operations=operations
+                hidden_size, 16, 8, head_dim, hidden_size * 3, device,
+                rms_norm_eps=1e-6, dtype=dtype, operations=operations
             )
             for _ in range(num_layers)
         ])
@@ -1009,6 +1011,7 @@ class AudioTokenDetokenizer(nn.Module):
 class AceStepConditionGenerationModel(nn.Module):
     def __init__(
         self,
+        device,
         in_channels=192,
         hidden_size=2048,
         text_hidden_dim=1024,
@@ -1038,7 +1041,6 @@ class AceStepConditionGenerationModel(nn.Module):
         encoder_num_heads=16,
         audio_model=None,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -1061,8 +1063,8 @@ class AceStepConditionGenerationModel(nn.Module):
         )
         self.encoder = AceStepConditionEncoder(
             text_hidden_dim, timbre_hidden_dim, encoder_hidden_size, num_lyric_layers, num_timbre_layers,
-            encoder_num_heads, num_kv_heads, head_dim, encoder_intermediate_size, rms_norm_eps,
-            dtype=dtype, device=device, operations=operations
+            encoder_num_heads, num_kv_heads, head_dim, device, encoder_intermediate_size, rms_norm_eps,
+            dtype=dtype, operations=operations
         )
         self.tokenizer = AceStepAudioTokenizer(
             audio_acoustic_hidden_dim, encoder_hidden_size, pool_window_size, fsq_dim=fsq_dim, fsq_levels=fsq_levels, fsq_input_num_quantizers=fsq_input_num_quantizers, num_layers=num_tokenizer_layers, head_dim=head_dim, rms_norm_eps=rms_norm_eps,

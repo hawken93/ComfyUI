@@ -173,7 +173,7 @@ class SDXLRefiner(supported_models_base.BASE):
     latent_format = latent_formats.SDXL
     memory_usage_factor = 1.0
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.SDXLRefiner(self, device=device)
 
     def process_clip_state_dict(self, state_dict):
@@ -231,7 +231,7 @@ class SDXL(supported_models_base.BASE):
         else:
             return model_base.ModelType.EPS
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SDXL(self, model_type=self.model_type(state_dict, prefix), device=device)
         if self.inpaint_model():
             out.set_inpaint()
@@ -334,7 +334,7 @@ class SVD_img2vid(supported_models_base.BASE):
 
     sampling_settings = {"sigma_max": 700.0, "sigma_min": 0.002}
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SVD_img2vid(self, device=device)
         return out
 
@@ -355,7 +355,7 @@ class SV3D_u(SVD_img2vid):
 
     vae_key_prefix = ["conditioner.embedders.1.encoder."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SV3D_u(self, device=device)
         return out
 
@@ -372,7 +372,7 @@ class SV3D_p(SV3D_u):
     }
 
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SV3D_p(self, device=device)
         return out
 
@@ -400,7 +400,7 @@ class Stable_Zero123(supported_models_base.BASE):
 
     latent_format = latent_formats.SD15
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Stable_Zero123(self, device=device, cc_projection_weight=state_dict["cc_projection.weight"], cc_projection_bias=state_dict["cc_projection.bias"])
         return out
 
@@ -431,7 +431,7 @@ class SD_X4Upscaler(SD20):
         "linear_end": 0.02,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SD_X4Upscaler(self, device=device)
         return out
 
@@ -474,7 +474,7 @@ class Stable_Cascade_C(supported_models_base.BASE):
             state_dict["clip_g.transformer.text_projection.weight"] = state_dict.pop("clip_g.text_projection").transpose(0, 1)
         return state_dict
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.StableCascade_C(self, device=device)
         return out
 
@@ -497,7 +497,7 @@ class Stable_Cascade_B(Stable_Cascade_C):
 
     clip_vision_prefix = None
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.StableCascade_B(self, device=device)
         return out
 
@@ -511,7 +511,7 @@ class SD15_instructpix2pix(SD15):
         "in_channels": 8,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.SD15_instructpix2pix(self, device=device)
 
 class SDXL_instructpix2pix(SDXL):
@@ -525,7 +525,7 @@ class SDXL_instructpix2pix(SDXL):
         "in_channels": 8,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.SDXL_instructpix2pix(self, model_type=self.model_type(state_dict, prefix), device=device)
 
 class LotusD(SD20):
@@ -542,7 +542,7 @@ class LotusD(SD20):
         "num_head_channels": 64,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.Lotus(self, device=device)
 
 class SD3(supported_models_base.BASE):
@@ -562,7 +562,7 @@ class SD3(supported_models_base.BASE):
 
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SD3(self, device=device)
         return out
 
@@ -594,7 +594,7 @@ class StableAudio(supported_models_base.BASE):
     text_encoder_key_prefix = ["text_encoders."]
     vae_key_prefix = ["pretransform.model."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         seconds_start_sd = utils.state_dict_prefix_replace(state_dict, {"conditioner.conditioners.seconds_start.": ""}, filter_keys=True)
         seconds_total_sd = utils.state_dict_prefix_replace(state_dict, {"conditioner.conditioners.seconds_total.": ""}, filter_keys=True)
         return model_base.StableAudio1(self, seconds_start_embedder_weights=seconds_start_sd, seconds_total_embedder_weights=seconds_total_sd, device=device)
@@ -627,7 +627,7 @@ class StableAudio3(StableAudio):
 
     memory_usage_factor = 7
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         seconds_total_sd = utils.state_dict_prefix_replace(state_dict, {"conditioner.conditioners.seconds_total.": ""}, filter_keys=True)
         padding_embedding = state_dict.get("conditioner.conditioners.prompt.padding_embedding", None)
         return model_base.StableAudio3(self, seconds_total_embedder_weights=seconds_total_sd, padding_embedding=padding_embedding, device=device)
@@ -651,7 +651,7 @@ class AuraFlow(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.AuraFlow(self, device=device)
         return out
 
@@ -678,7 +678,7 @@ class PixArtAlpha(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.PixArt(self, device=device)
         return out.eval()
 
@@ -712,7 +712,7 @@ class HunyuanDiT(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanDiT(self, device=device)
         return out
 
@@ -759,7 +759,7 @@ class Flux(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Flux(self, device=device)
         return out
 
@@ -788,7 +788,7 @@ class FluxSchnell(Flux):
         "shift": 1.0,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Flux(self, model_type=model_base.ModelType.FLOW, device=device)
         return out
 
@@ -813,7 +813,7 @@ class Flux2(Flux):
         super().__init__(unet_config)
         self.memory_usage_factor = self.memory_usage_factor * (2.0 * 2.0) * (unet_config['hidden_size'] / 2604)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Flux2(self, device=device)
         return out
 
@@ -862,7 +862,7 @@ class Lens(supported_models_base.BASE):
     def __init__(self, unet_config):
         super().__init__(unet_config)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.Lens(self, model_type=model_base.ModelType.FLUX, device=device)
 
     def clip_target(self, state_dict={}):
@@ -901,7 +901,7 @@ class GenmoMochi(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.GenmoMochi(self, device=device)
         return out
 
@@ -933,7 +933,7 @@ class LTXV(supported_models_base.BASE):
         super().__init__(unet_config)
         self.memory_usage_factor = (unet_config.get("cross_attention_dim", 2048) / 2048) * 5.5
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.LTXV(self, device=device)
         return out
 
@@ -953,7 +953,7 @@ class LTXAV(LTXV):
         super().__init__(unet_config)
         self.memory_usage_factor = 0.077  # TODO
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.LTXAV(self, device=device)
         return out
 
@@ -977,7 +977,7 @@ class MiniMaxH3(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.MiniMaxH3(self, device=device)
 
     def clip_target(self, state_dict={}, prefix=""):
@@ -1004,7 +1004,7 @@ class HunyuanVideo(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanVideo(self, device=device)
         return out
 
@@ -1041,7 +1041,7 @@ class HunyuanVideoI2V(HunyuanVideo):
         "in_channels": 33,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanVideoI2V(self, device=device)
         return out
 
@@ -1051,7 +1051,7 @@ class HunyuanVideoSkyreelsI2V(HunyuanVideo):
         "in_channels": 32,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanVideoSkyreelsI2V(self, device=device)
         return out
 
@@ -1077,7 +1077,7 @@ class CosmosT2V(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.CosmosVideo(self, device=device)
         return out
 
@@ -1092,7 +1092,7 @@ class CosmosI2V(CosmosT2V):
         "in_channels": 17,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.CosmosVideo(self, image_to_video=True, device=device)
         return out
 
@@ -1119,7 +1119,7 @@ class CosmosT2IPredict2(supported_models_base.BASE):
         super().__init__(unet_config)
         self.memory_usage_factor = (unet_config.get("model_channels", 2048) / 2048) * 0.95
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.CosmosPredict2(self, device=device)
         return out
 
@@ -1145,7 +1145,7 @@ class Anima(supported_models_base.BASE):
 
     supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Anima(self, device=device)
         return out
 
@@ -1166,7 +1166,7 @@ class CosmosI2VPredict2(CosmosT2IPredict2):
         "in_channels": 17,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.CosmosPredict2(self, image_to_video=True, device=device)
         return out
 
@@ -1190,7 +1190,7 @@ class Lumina2(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Lumina2(self, device=device)
         return out
 
@@ -1236,7 +1236,7 @@ class ZImagePixelSpace(ZImage):
     # Much lower memory than latent-space models (no VAE, small patches).
     memory_usage_factor = 0.03 # TODO: figure out the optimal value for this.
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.ZImagePixelSpace(self, device=device)
 
 class PixelDiTT2I(supported_models_base.BASE):
@@ -1257,7 +1257,7 @@ class PixelDiTT2I(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.PixelDiTT2I(self, device=device)
 
     def process_unet_state_dict(self, state_dict):
@@ -1302,7 +1302,7 @@ class PiD(PixelDiTT2I):
 
     memory_usage_factor = 0.04
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.PiD(self, device=device)
 
 class WAN21_T2V(supported_models_base.BASE):
@@ -1329,7 +1329,7 @@ class WAN21_T2V(supported_models_base.BASE):
         super().__init__(unet_config)
         self.memory_usage_factor = self.unet_config.get("dim", 2000) / 2222
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21(self, device=device)
         return out
 
@@ -1353,7 +1353,7 @@ class WAN21_CausalAR_T2V(WAN21_T2V):
         super().__init__(unet_config)
         self.unet_config.pop("causal_ar", None)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.WAN21_CausalAR(self, device=device)
 
 
@@ -1364,7 +1364,7 @@ class WAN21_I2V(WAN21_T2V):
         "in_dim": 36,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21(self, image_to_video=True, device=device)
         return out
 
@@ -1375,7 +1375,7 @@ class WAN21_FunControl2V(WAN21_T2V):
         "in_dim": 48,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21(self, image_to_video=False, device=device)
         return out
 
@@ -1386,7 +1386,7 @@ class WAN21_Camera(WAN21_T2V):
         "in_dim": 32,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_Camera(self, image_to_video=False, device=device)
         return out
 
@@ -1397,7 +1397,7 @@ class WAN22_Camera(WAN21_T2V):
         "in_dim": 36,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_Camera(self, image_to_video=False, device=device)
         return out
 
@@ -1411,7 +1411,7 @@ class WAN21_Vace(WAN21_T2V):
         super().__init__(unet_config)
         self.memory_usage_factor = 1.2 * self.memory_usage_factor
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_Vace(self, image_to_video=False, device=device)
         return out
 
@@ -1421,7 +1421,7 @@ class WAN21_HuMo(WAN21_T2V):
         "model_type": "humo",
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_HuMo(self, image_to_video=False, device=device)
         return out
 
@@ -1434,7 +1434,7 @@ class WAN22_S2V(WAN21_T2V):
     def __init__(self, unet_config):
         super().__init__(unet_config)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN22_S2V(self, device=device)
         return out
 
@@ -1447,7 +1447,7 @@ class WAN22_Animate(WAN21_T2V):
     def __init__(self, unet_config):
         super().__init__(unet_config)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN22_Animate(self, device=device)
         return out
 
@@ -1461,7 +1461,7 @@ class WAN_Animate2(WAN21_T2V):
         "shift": 5.0,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN_Animate2(self, device=device)
         return out
 
@@ -1474,7 +1474,7 @@ class WAN22_T2V(WAN21_T2V):
 
     latent_format = latent_formats.Wan22
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN22(self, image_to_video=True, device=device)
         return out
 
@@ -1484,7 +1484,7 @@ class WAN21_FlowRVS(WAN21_T2V):
         "model_type": "flow_rvs",
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_FlowRVS(self, image_to_video=True, device=device)
         return out
 
@@ -1494,7 +1494,7 @@ class WAN21_SCAIL(WAN21_T2V):
         "model_type": "scail",
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_SCAIL(self, image_to_video=False, device=device)
         return out
 
@@ -1505,7 +1505,7 @@ class WAN21_SCAIL2(WAN21_T2V):
         "model_type": "scail2",
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN21_SCAIL2(self, image_to_video=False, device=device)
         return out
 
@@ -1520,7 +1520,7 @@ class WAN22_WanDancer(WAN21_T2V):
         super().__init__(unet_config)
         self.memory_usage_factor = 1.8
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.WAN22_WanDancer(self, image_to_video=True, device=device)
         return out
 
@@ -1572,7 +1572,7 @@ class Hunyuan3Dv2(supported_models_base.BASE):
         replace_prefix = {"": "model."}
         return utils.state_dict_prefix_replace(state_dict, replace_prefix)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Hunyuan3Dv2(self, device=device)
         return out
 
@@ -1586,7 +1586,7 @@ class Hunyuan3Dv2_1(Hunyuan3Dv2):
 
     latent_format = latent_formats.Hunyuan3Dv2_1
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Hunyuan3Dv2_1(self, device = device)
         return out
 
@@ -1616,7 +1616,7 @@ class TripoSplat(supported_models_base.BASE):
 
     supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.TripoSplat(self, device=device)
 
     def clip_target(self, state_dict={}):
@@ -1644,7 +1644,7 @@ class HiDream(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HiDream(self, device=device)
         return out
 
@@ -1671,7 +1671,7 @@ class HiDreamO1(supported_models_base.BASE):
 
     optimizations = {"fp8": False}
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.HiDreamO1(self, device=device)
 
     def process_unet_state_dict(self, state_dict):
@@ -1722,7 +1722,7 @@ class Chroma(supported_models_base.BASE):
             out_sd[key_out] = state_dict[k]
         return out_sd
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Chroma(self, device=device)
         return out
 
@@ -1758,7 +1758,7 @@ class SeedVR2(supported_models_base.BASE):
             manual_cast_dtype = torch.bfloat16
         super().set_inference_dtype(dtype, manual_cast_dtype, device=device)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.SeedVR2(self, device=device)
         return out
 
@@ -1775,7 +1775,7 @@ class ChromaRadiance(Chroma):
     # Pixel-space model, no spatial compression for model input.
     memory_usage_factor = 0.044
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.ChromaRadiance(self, device=device)
 
 class ACEStep(supported_models_base.BASE):
@@ -1799,7 +1799,7 @@ class ACEStep(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.ACEStep(self, device=device)
         return out
 
@@ -1831,7 +1831,7 @@ class Omnigen2(supported_models_base.BASE):
         if comfy.model_management.extended_fp16_support():
             self.supported_inference_dtypes = [torch.float16] + self.supported_inference_dtypes
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Omnigen2(self, device=device)
         return out
 
@@ -1852,7 +1852,7 @@ class Boogu(Omnigen2):
 
     memory_usage_factor = 2.15
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Boogu(self, device=device)
         return out
 
@@ -1890,7 +1890,7 @@ class Ideogram4(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Ideogram4(self, device=device)
         return out
 
@@ -1919,7 +1919,7 @@ class Krea2(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Krea2(self, device=device)
         return out
 
@@ -1948,7 +1948,7 @@ class MageFlow(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.MageFlow(self, device=device)
         return out
 
@@ -1977,7 +1977,7 @@ class QwenImage(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.QwenImage(self, device=device)
         return out
 
@@ -2010,7 +2010,7 @@ class JoyImage(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.JoyImage(self, device=device)
 
     def clip_target(self, state_dict={}):
@@ -2034,7 +2034,7 @@ class HunyuanImage21(HunyuanVideo):
 
     supported_inference_dtypes = [torch.bfloat16, torch.float32]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanImage21(self, device=device)
         return out
 
@@ -2056,7 +2056,7 @@ class HunyuanImage21Refiner(HunyuanVideo):
 
     latent_format = latent_formats.HunyuanImage21Refiner
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanImage21Refiner(self, device=device)
         return out
 
@@ -2074,7 +2074,7 @@ class HunyuanVideo15(HunyuanVideo):
 
     latent_format = latent_formats.HunyuanVideo15
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanVideo15(self, device=device)
         return out
 
@@ -2099,7 +2099,7 @@ class HunyuanVideo15_SR_Distilled(HunyuanVideo):
 
     latent_format = latent_formats.HunyuanVideo15
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.HunyuanVideo15_SR_Distilled(self, device=device)
         return out
 
@@ -2128,7 +2128,7 @@ class Kandinsky5(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Kandinsky5(self, device=device)
         return out
 
@@ -2152,7 +2152,7 @@ class Kandinsky5Image(Kandinsky5):
     latent_format = latent_formats.Flux
     memory_usage_factor = 1.25 #TODO
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.Kandinsky5Image(self, device=device)
         return out
 
@@ -2184,7 +2184,7 @@ class ACEStep15(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.ACEStep15(self, device=device)
         return out
 
@@ -2211,7 +2211,7 @@ class MiniMaxMusic3(supported_models_base.BASE):
     supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
     sampling_settings = {"multiplier": 1.0}
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.MiniMaxMusic3(self, device=device)
 
     def model_type(self, state_dict, prefix=""):
@@ -2246,7 +2246,7 @@ class LongCatImage(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.LongCatImage(self, device=device)
         return out
 
@@ -2263,7 +2263,7 @@ class RT_DETR_v4(supported_models_base.BASE):
 
     supported_inference_dtypes = [torch.float16, torch.float32]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.RT_DETR_v4(self, device=device)
         return out
 
@@ -2281,7 +2281,7 @@ class DepthAnything3(supported_models_base.BASE):
 
     supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.DepthAnything3(self, device=device)
 
     def clip_target(self, state_dict={}):
@@ -2308,7 +2308,7 @@ class ErnieImage(supported_models_base.BASE):
     vae_key_prefix = ["vae."]
     text_encoder_key_prefix = ["text_encoders."]
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         out = model_base.ErnieImage(self, device=device)
         return out
 
@@ -2357,7 +2357,7 @@ class SAM3(supported_models_base.BASE):
                 state_dict[new_k] = state_dict.pop(k)
         return state_dict
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         return model_base.SAM3(self, device=device)
 
     def clip_target(self, state_dict={}):
@@ -2397,7 +2397,7 @@ class CogVideoX_T2V(supported_models_base.BASE):
             self.latent_format = latent_formats.CogVideoX1_5
         super().__init__(unet_config)
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         # CogVideoX 1.5 (patch_size_t=2) has different training base dimensions for RoPE
         if self.unet_config.get("patch_size_t") is not None:
             self.unet_config.setdefault("sample_height", 96)
@@ -2415,7 +2415,7 @@ class CogVideoX_I2V(CogVideoX_T2V):
         "in_channels": 32,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         if self.unet_config.get("patch_size_t") is not None:
             self.unet_config.setdefault("sample_height", 96)
             self.unet_config.setdefault("sample_width", 170)
@@ -2429,7 +2429,7 @@ class CogVideoX_Inpaint(CogVideoX_T2V):
         "in_channels": 48,
     }
 
-    def get_model(self, state_dict, prefix="", device=None):
+    def get_model(self, device, state_dict, prefix=""):
         if self.unet_config.get("patch_size_t") is not None:
             self.unet_config.setdefault("sample_height", 96)
             self.unet_config.setdefault("sample_width", 170)

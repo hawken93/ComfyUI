@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 
 class GELU(nn.Module):
@@ -27,8 +27,8 @@ class GELU(nn.Module):
 
 class FeedForward(nn.Module):
 
-    def __init__(self, dim: int, dim_out = None, mult: int = 4,
-                dropout: float = 0.0, inner_dim = None, operations = None, device = None, dtype = None):
+    def __init__(self, dim: int, device, dtype, dim_out = None, mult: int = 4,
+                dropout: float = 0.0, inner_dim = None, operations = None):
 
         super().__init__()
         if inner_dim is None:
@@ -72,7 +72,7 @@ class AddAuxLoss(torch.autograd.Function):
 
 class MoEGate(nn.Module):
 
-    def __init__(self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01, device = None, dtype = None):
+    def __init__(self, embed_dim, device, dtype, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01):
 
         super().__init__()
         self.top_k = num_experts_per_tok
@@ -112,8 +112,8 @@ class MoEGate(nn.Module):
         return topk_idx, topk_weight, aux_loss
 
 class MoEBlock(nn.Module):
-    def __init__(self, dim, num_experts: int = 6, moe_top_k: int = 2, dropout: float = 0.0,
-                 ff_inner_dim: int = None, operations = None, device = None, dtype = None):
+    def __init__(self, dim, device, dtype, num_experts: int = 6, moe_top_k: int = 2, dropout: float = 0.0,
+                 ff_inner_dim: int = None, operations = None):
         super().__init__()
 
         self.moe_top_k = moe_top_k
@@ -233,7 +233,7 @@ class Timesteps(nn.Module):
         return emb
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size = 256, cond_proj_dim = None, operations = None, device = None, dtype = None):
+    def __init__(self, hidden_size, device, dtype, frequency_embedding_size = 256, cond_proj_dim = None, operations = None):
         super().__init__()
 
         self.mlp = nn.Sequential(
@@ -262,7 +262,7 @@ class TimestepEmbedder(nn.Module):
         return time_conditioned.unsqueeze(1)
 
 class MLP(nn.Module):
-    def __init__(self, *, width: int, operations = None, device = None, dtype = None):
+    def __init__(self, width: int, device, dtype, operations = None):
         super().__init__()
         self.width = width
         self.fc1 = operations.Linear(width, width * 4, device = device, dtype = dtype)
@@ -278,13 +278,13 @@ class CrossAttention(nn.Module):
         qdim,
         kdim,
         num_heads,
+        device,
+        dtype,
         qkv_bias=True,
         qk_norm=False,
         norm_layer=nn.LayerNorm,
         use_fp16: bool = False,
         operations = None,
-        dtype = None,
-        device = None,
         **kwargs,
     ):
         super().__init__()
@@ -313,6 +313,7 @@ class CrossAttention(nn.Module):
         self.q_norm = norm_layer(self.head_dim, elementwise_affine=True, eps = eps, device = device, dtype = dtype) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim, elementwise_affine=True, eps = eps, device = device, dtype = dtype) if qk_norm else nn.Identity()
         self.out_proj = operations.Linear(qdim, qdim, bias=True, device = device, dtype = dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x, y):
 
@@ -338,7 +339,7 @@ class CrossAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        x = optimized_attention(
+        x = self.optimized_attention(
             q.reshape(b, s1, self.num_heads * self.head_dim),
             k.reshape(b, s2, self.num_heads * self.head_dim),
             v,
@@ -356,13 +357,13 @@ class Attention(nn.Module):
         self,
         dim,
         num_heads,
+        device,
+        dtype,
         qkv_bias = True,
         qk_norm = False,
         norm_layer = nn.LayerNorm,
         use_fp16: bool = False,
-        operations = None,
-        device = None,
-        dtype = None
+        operations = None
     ):
         super().__init__()
         self.dim = dim
@@ -387,6 +388,7 @@ class Attention(nn.Module):
         self.q_norm = norm_layer(self.head_dim, elementwise_affine=True, eps = eps, device = device, dtype = dtype) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim, elementwise_affine=True, eps = eps, device = device, dtype = dtype) if qk_norm else nn.Identity()
         self.out_proj = operations.Linear(dim, dim, device = device, dtype = dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x):
         B, N, _ = x.shape
@@ -408,7 +410,7 @@ class Attention(nn.Module):
         query = self.q_norm(query)
         key = self.k_norm(key)
 
-        x = optimized_attention(
+        x = self.optimized_attention(
             query.reshape(B, N, self.num_heads * self.head_dim),
             key.reshape(B, N, self.num_heads * self.head_dim),
             value,
@@ -425,6 +427,7 @@ class HunYuanDiTBlock(nn.Module):
         hidden_size,
         c_emb_size,
         num_heads,
+        device, dtype,
         text_states_dim=1024,
         qk_norm=False,
         norm_layer=nn.LayerNorm,
@@ -436,8 +439,7 @@ class HunYuanDiTBlock(nn.Module):
         num_experts: int = 8,
         moe_top_k: int = 2,
         use_fp16: bool = False,
-        operations = None,
-        device = None, dtype = None
+        operations = None
     ):
         super().__init__()
 
@@ -518,7 +520,7 @@ class HunYuanDiTBlock(nn.Module):
 
 class FinalLayer(nn.Module):
 
-    def __init__(self, final_hidden_size, out_channels, operations, use_fp16: bool = False, device = None, dtype = None):
+    def __init__(self, final_hidden_size, out_channels, operations, device, dtype, use_fp16: bool = False):
         super().__init__()
 
         if use_fp16:
@@ -540,6 +542,9 @@ class HunYuanDiTPlain(nn.Module):
     # init with the defaults values from https://huggingface.co/tencent/Hunyuan3D-2.1/blob/main/hunyuan3d-dit-v2-1/config.yaml
     def __init__(
         self,
+        device,
+        operations,
+        dtype=None,
         in_channels: int = 64,
         hidden_size: int = 2048,
         context_dim: int = 1024,
@@ -553,9 +558,6 @@ class HunYuanDiTPlain(nn.Module):
         num_experts: int = 8,
         moe_top_k: int = 2,
         use_fp16: bool = False,
-        dtype = None,
-        device = None,
-        operations = None,
         **kwargs
         ):
 
@@ -578,7 +580,7 @@ class HunYuanDiTPlain(nn.Module):
         self.guidance_cond_proj_dim = guidance_cond_proj_dim
 
         self.x_embedder = operations.Linear(in_channels, hidden_size, bias = True, device = device, dtype = dtype)
-        self.t_embedder = TimestepEmbedder(hidden_size, hidden_size * 4, cond_proj_dim = guidance_cond_proj_dim, device = device, dtype = dtype, operations = operations)
+        self.t_embedder = TimestepEmbedder(hidden_size, device, dtype, hidden_size * 4, cond_proj_dim = guidance_cond_proj_dim, operations = operations)
 
 
         # HUnYuanDiT Blocks

@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
 
 # TODO these are mixed between placement preferences and machine info.
-# DISABLED - mixed with args.cpu, VRAMState should simply be irrelevant in this case
 # NO_VRAM - appropriate
 # LOW_VRAM - appropriate
 # NORMAL_VRAM - appropriate
@@ -50,7 +49,6 @@ if TYPE_CHECKING:
 # SHARED - doesn't really belong here. Should be a property of the torch device (meaning device does not have its own
 #          vram). This is also different from whether torch device supports using shared memory.
 class VRAMState(Enum):
-    DISABLED = 0    #No vram present: no need to move models to vram
     NO_VRAM = 1     #Very low vram: enable all the options to save vram
     LOW_VRAM = 2
     NORMAL_VRAM = 3
@@ -144,11 +142,6 @@ def is_wsl():
         return True
     return False
 
-def get_torch_device():
-    devices = get_all_torch_devices()
-    # TODO random choice for now; better planning in the future
-    return random.choice(devices)
-
 def get_all_torch_devices(include_cpu=False):
     devices = []
     if args.cpu:
@@ -186,6 +179,35 @@ def get_all_torch_devices(include_cpu=False):
         devices.append(torch.device("cpu"))
 
     return devices
+
+def get_torch_device(device_str):
+    if device_str == "cpu":
+        return torch.device("cpu")
+    elif directml_enabled and device_str == str(directml_device):
+        return directml_device
+
+    if ':' not in device_str:
+        raise KeyError(device_str)
+    type_str, idx = device_str.split(':', 1)
+    try:
+        idx = int(idx)
+    except ValueError:
+        raise KeyError(device_str)
+    if idx < 0:
+        raise KeyError(device_str)
+
+    if cuda_available and type_str == "cuda" and idx < torch.cuda.device_count():
+        return torch.device(type_str, idx)
+    elif xpu_available and type_str == "xpu" and idx < torch.xpu.device_count():
+        return torch.device(type_str, idx)
+    elif npu_available and type_str == "npu" and idx < torch.npu.device_count():
+        return torch.device(type_str, idx)
+    elif mlu_available and type_str == "mlu" and idx < torch.mlu.device_count():
+        return torch.device(type_str, idx)
+    elif mps_available and type_str == "mps" and idx < torch.mps.device_count():
+        return torch.device(type_str, idx)
+    else:
+        raise KeyError(device_str)
 
 def get_suitable_devices(memory_required=0, dtype=None):
     """Filter all devices to those meeting the workload's hard requirements.
@@ -284,6 +306,23 @@ def resolve_gpu_device_option(option: str):
         if str(dev) == option:
             return dev
     return None
+
+
+def pick_device_for_option(option, memory_required=0, dtype=None, prefer_xformers=False):
+    """Resolve a user device option to a concrete device, falling back to
+    pick_device when the option is "default", None, or not available.
+
+    Intended for loaders and other callers that must end up with a device.
+    Callers that want to act on an unavailable pin (e.g. pass through
+    unchanged) should use resolve_gpu_device_option directly.
+    """
+    resolved = resolve_gpu_device_option(option)
+    if resolved is not None:
+        return resolved
+    if option not in (None, "default"):
+        logging.info(f"Requested device '{option}' not available, using default device selection.")
+    return pick_device(memory_required=memory_required, dtype=dtype, prefer_xformers=prefer_xformers)
+
 
 @contextmanager
 def cuda_device_context(device):
@@ -556,9 +595,6 @@ if lowvram_available:
     if set_vram_to in (VRAMState.LOW_VRAM, VRAMState.NO_VRAM):
         vram_state = set_vram_to
 
-
-if args.cpu or get_torch_device().type == "cpu":
-    vram_state = VRAMState.DISABLED
 
 if not args.cpu and mps_available:
     vram_state = VRAMState.SHARED
@@ -876,6 +912,20 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
                 soft_empty_cache()
     return unloaded_models
 
+# TODO: placement calculator. Device placement is an external decision: keep
+# implementations device-receiving (no pick_device below the caller layer) so
+# a future layer can feed every call site. The calculator itself is deferred,
+# mainly because co-residency is not "the whole graph" but the peak concurrent
+# sets (the get_additional_models structure), which needs its own design.
+# When it lands: gather per-model residency requirements as data (size,
+# dtype/backend-valid devices, co-residency group, user pin vs free) as early
+# as the prompt level, where all pins and files are literals; a pure function
+# over those requirements plus the current_loaded_models residency snapshot
+# and per-device capacity returns {model: device}, with rest-on-cpu-and-stream
+# as the explicit doesn't-fit outcome. "default" resolution is part of that
+# calculation, not a pick_device() at load time. This function stays a
+# consumer of the returned placements.
+
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     cleanup_models_gc()
     global vram_state
@@ -953,12 +1003,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
     for loaded_model in models_to_load:
         model = loaded_model.model
         torch_dev = model.load_device
-        if is_device_cpu(torch_dev):
-            vram_set_state = VRAMState.DISABLED
-        else:
-            vram_set_state = vram_state
         lowvram_model_memory = 0
-        if lowvram_available and (vram_set_state == VRAMState.LOW_VRAM or vram_set_state == VRAMState.NORMAL_VRAM) and not force_full_load:
+        if lowvram_available and (vram_state == VRAMState.LOW_VRAM or vram_state == VRAMState.NORMAL_VRAM) and not force_full_load:
             loaded_memory = loaded_model.model_loaded_memory()
             current_free_mem = get_free_memory(torch_dev) + loaded_memory
 
@@ -968,7 +1014,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             if lowvram_model_memory == 0:
                 lowvram_model_memory = 0.1
 
-        if vram_set_state == VRAMState.NO_VRAM:
+        if vram_state == VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
@@ -1149,17 +1195,24 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
 
     return torch.float32
 
-def text_encoder_offload_device():
+def text_encoder_offload_device(device):
     if args.gpu_only:
-        return get_torch_device()
+        return device
     else:
         return torch.device("cpu")
 
-def text_encoder_device():
+def text_encoder_device(device):
+    # TODO: The caller must ensure the device does support the required dtype.
+    # The remaining hack in this function is to reject non-float16 devices
+    if not should_use_fp16(device):
+        return torch.device("cpu")
+
     if args.gpu_only:
-        return get_torch_device()
-    elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM) or comfy.memory_management.aimdo_enabled:
-        return pick_device(dtype=torch.float16)
+        return device
+    elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM):
+        return device
+    elif comfy.memory_management.aimdo_enabled:
+        return device
     else:
         return torch.device("cpu")
 
@@ -1198,9 +1251,9 @@ def text_encoder_dtype(device):
     return torch.float16
 
 
-def intermediate_device():
+def intermediate_device(device):
     if args.gpu_only:
-        return get_torch_device()
+        return device
     else:
         return torch.device("cpu")
 
@@ -1210,14 +1263,14 @@ def intermediate_dtype():
     else:
         return torch.float32
 
-def vae_device():
+def vae_device(device):
     if args.cpu_vae:
         return torch.device("cpu")
-    return get_torch_device()
+    return device
 
-def vae_offload_device():
+def vae_offload_device(device):
     if args.gpu_only:
-        return get_torch_device()
+        return device
     else:
         return torch.device("cpu")
 

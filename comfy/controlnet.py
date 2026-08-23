@@ -233,12 +233,13 @@ class ControlBase:
 
 
 class ControlNet(ControlBase):
-    def __init__(self, control_model=None, global_average_pooling=False, compression_ratio=8, latent_format=None, load_device=None, manual_cast_dtype=None, extra_conds=["y"], strength_type=StrengthType.CONSTANT, concat_mask=False, preprocess_image=lambda a: a):
+    def __init__(self, load_device, offload_device, control_model=None, global_average_pooling=False, compression_ratio=8, latent_format=None, manual_cast_dtype=None, extra_conds=["y"], strength_type=StrengthType.CONSTANT, concat_mask=False, preprocess_image=lambda a: a):
         super().__init__()
         self.control_model = control_model
         self.load_device = load_device
+        self.offload_device = offload_device
         if control_model is not None:
-            self.control_model_wrapped = comfy.model_patcher.CoreModelPatcher(self.control_model, load_device=load_device, offload_device=comfy.model_management.unet_offload_device())
+            self.control_model_wrapped = comfy.model_patcher.CoreModelPatcher(self.control_model, load_device, offload_device)
 
         self.compression_ratio = compression_ratio
         self.global_average_pooling = global_average_pooling
@@ -313,7 +314,7 @@ class ControlNet(ControlBase):
         return self.control_merge(control, control_prev, output_dtype=None)
 
     def copy(self):
-        c = ControlNet(None, global_average_pooling=self.global_average_pooling, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
+        c = ControlNet(self.load_device, self.offload_device, None, self.global_average_pooling, manual_cast_dtype=self.manual_cast_dtype)
         c.control_model = self.control_model
         c.control_model_wrapped = self.control_model_wrapped
         self.copy_to(c)
@@ -321,8 +322,10 @@ class ControlNet(ControlBase):
 
     def deepclone_multigpu(self, load_device, autoregister=False):
         c = self.copy()
+        c.load_device = load_device
+        c.offload_device = comfy.model_management.unet_offload_device(load_device)
         c.control_model = copy.deepcopy(c.control_model)
-        c.control_model_wrapped = comfy.model_patcher.ModelPatcher(c.control_model, load_device=load_device, offload_device=comfy.model_management.unet_offload_device())
+        c.control_model_wrapped = comfy.model_patcher.ModelPatcher(c.control_model, load_device, c.offload_device)
         if autoregister:
             self.multigpu_clones[load_device] = c
         return c
@@ -362,7 +365,7 @@ class QwenFunControlNet(ControlNet):
         super().cleanup()
 
     def copy(self):
-        c = QwenFunControlNet(None, global_average_pooling=self.global_average_pooling, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
+        c = QwenFunControlNet(self.load_device, self.offload_device, None, self.global_average_pooling, manual_cast_dtype=self.manual_cast_dtype)
         c.control_model = self.control_model
         c.control_model_wrapped = self.control_model_wrapped
         self.copy_to(c)
@@ -429,7 +432,21 @@ class ControlLoraOps:
             return x
 
 class ControlLora(ControlNet):
-    def __init__(self, control_weights, global_average_pooling=False, model_options={}): #TODO? model_options
+    # TODO: make ControlLora the (lora, model) pairing, not a model-agnostic
+    # carrier whose self.control_model slot is rewritten on every pre_run.
+    # - The loader carries the recipe (raw weights + recipe-intrinsic params);
+    #   it has no model, so it cannot build the pairing.
+    # - A static validate() takes what __init__ takes today and returns True;
+    #   no new checks are invented. The loader calls it; it is the home for
+    #   real validation, added later.
+    # - pre_run_control materializes/looks up the pairing per (lora, model),
+    #   built once on model.load_device and reused across samplings instead of
+    #   rebuilding every pre_run.
+    # - Open: the built model references the paired model's tensors; reusing a
+    #   pairing across samplings needs a freshness signal if the model's
+    #   weights can change underneath it.
+    def __init__(self, control_weights, global_average_pooling=False, model_options={}):
+        # TODO? model_options
         ControlBase.__init__(self)
         self.control_weights = control_weights
         self.global_average_pooling = global_average_pooling
@@ -452,8 +469,8 @@ class ControlLora(ControlNet):
 
         controlnet_config["operations"] = control_lora_ops
         controlnet_config["dtype"] = dtype
+        controlnet_config["device"] = model.load_device
         self.control_model = comfy.cldm.cldm.ControlNet(**controlnet_config)
-        self.control_model.to(comfy.model_management.get_torch_device())
         diffusion_model = model.diffusion_model
         sd = diffusion_model.state_dict()
 
@@ -467,7 +484,7 @@ class ControlLora(ControlNet):
         for k in self.control_weights:
             if (k not in {"lora_controlnet"}):
                 if (k.endswith(".up") or k.endswith(".down") or k.endswith(".weight") or k.endswith(".bias")) and ("__" not in k):
-                    comfy.utils.set_attr_param(self.control_model, k, self.control_weights[k].to(dtype).to(comfy.model_management.get_torch_device()))
+                    comfy.utils.set_attr_param(self.control_model, k, self.control_weights[k].to(dtype).to(model.load_device))
 
     def copy(self):
         c = ControlLora(self.control_weights, global_average_pooling=self.global_average_pooling)
@@ -486,7 +503,9 @@ class ControlLora(ControlNet):
     def inference_memory_requirements(self, dtype):
         return comfy.utils.calculate_parameters(self.control_weights) * comfy.model_management.dtype_size(dtype) + ControlBase.inference_memory_requirements(self, dtype)
 
-def controlnet_config(sd, model_options={}):
+def controlnet_config(sd, load_device, model_options={}):
+    offload_device = comfy.model_management.unet_offload_device(load_device)
+
     model_config = comfy.model_detection.model_config_from_unet(sd, "", True)
 
     unet_dtype = model_options.get("dtype", None)
@@ -494,16 +513,14 @@ def controlnet_config(sd, model_options={}):
         weight_dtype = comfy.utils.weight_dtype(sd)
 
         supported_inference_dtypes = list(model_config.supported_inference_dtypes)
-        unet_dtype = comfy.model_management.unet_dtype(model_params=-1, supported_dtypes=supported_inference_dtypes, weight_dtype=weight_dtype)
+        unet_dtype = comfy.model_management.unet_dtype(load_device, model_params=-1, supported_dtypes=supported_inference_dtypes, weight_dtype=weight_dtype)
 
-    load_device = comfy.model_management.get_torch_device()
     manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, load_device)
 
     operations = model_options.get("custom_operations", None)
     if operations is None:
         operations = comfy.ops.pick_operations(unet_dtype, manual_cast_dtype, disable_fast_fp8=True)
 
-    offload_device = comfy.model_management.unet_offload_device()
     return model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device
 
 def controlnet_load_state_dict(control_model, sd):
@@ -517,9 +534,9 @@ def controlnet_load_state_dict(control_model, sd):
     return control_model
 
 
-def load_controlnet_mmdit(sd, model_options={}):
+def load_controlnet_mmdit(sd, load_device, model_options={}):
     new_sd = comfy.model_detection.convert_diffusers_mmdit(sd, "")
-    model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(new_sd, model_options=model_options)
+    model_config, operations, _, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(new_sd, load_device, model_options=model_options)
     num_blocks = comfy.model_detection.count_blocks(new_sd, 'joint_blocks.{}.')
     for k in sd:
         new_sd[k] = sd[k]
@@ -534,7 +551,7 @@ def load_controlnet_mmdit(sd, model_options={}):
 
     latent_format = comfy.latent_formats.SD3()
     latent_format.shift_factor = 0 #SD3 controlnet weirdness
-    control = ControlNet(control_model, compression_ratio=1, latent_format=latent_format, concat_mask=concat_mask, load_device=load_device, manual_cast_dtype=manual_cast_dtype)
+    control = ControlNet(load_device, offload_device, control_model, compression_ratio=1, latent_format=latent_format, concat_mask=concat_mask, manual_cast_dtype=manual_cast_dtype)
     return control
 
 
@@ -547,13 +564,14 @@ class ControlNetSD35(ControlNet):
         super().pre_run(model, percent_to_timestep_function)
 
     def copy(self):
-        c = ControlNetSD35(None, global_average_pooling=self.global_average_pooling, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
+        c = ControlNetSD35(self.load_device, self.offload_device, None, self.global_average_pooling, manual_cast_dtype=self.manual_cast_dtype)
         c.control_model = self.control_model
         c.control_model_wrapped = self.control_model_wrapped
         self.copy_to(c)
         return c
 
-def load_controlnet_sd35(sd, model_options={}):
+def load_controlnet_sd35(sd, device, model_options={}):
+    offload_device = comfy.model_management.unet_offload_device(device)
     control_type = -1
     if "control_type" in sd:
         control_type = round(sd.pop("control_type").item())
@@ -577,11 +595,9 @@ def load_controlnet_sd35(sd, model_options={}):
     head_dim = hidden_size // num_heads
     num_blocks = comfy.model_detection.count_blocks(new_sd, 'transformer_blocks.{}.')
 
-    load_device = comfy.model_management.get_torch_device()
-    offload_device = comfy.model_management.unet_offload_device()
-    unet_dtype = comfy.model_management.unet_dtype(model_params=-1)
+    unet_dtype = comfy.model_management.unet_dtype(device, model_params=-1)
 
-    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, load_device)
+    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, device)
 
     operations = model_options.get("custom_operations", None)
     if operations is None:
@@ -609,34 +625,34 @@ def load_controlnet_sd35(sd, model_options={}):
     elif depth_cnet:
         preprocess_image = lambda a: 1.0 - a
 
-    control = ControlNetSD35(control_model, compression_ratio=1, latent_format=latent_format, load_device=load_device, manual_cast_dtype=manual_cast_dtype, preprocess_image=preprocess_image)
+    control = ControlNetSD35(device, offload_device, control_model, compression_ratio=1, latent_format=latent_format, manual_cast_dtype=manual_cast_dtype, preprocess_image=preprocess_image)
     return control
 
 
 
-def load_controlnet_hunyuandit(controlnet_data, model_options={}):
-    model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(controlnet_data, model_options=model_options)
+def load_controlnet_hunyuandit(controlnet_data, load_device, model_options={}):
+    model_config, operations, _, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(controlnet_data, load_device, model_options=model_options)
 
     control_model = comfy.ldm.hydit.controlnet.HunYuanControlNet(operations=operations, device=offload_device, dtype=unet_dtype)
     control_model = controlnet_load_state_dict(control_model, controlnet_data)
 
     latent_format = comfy.latent_formats.SDXL()
     extra_conds = ['text_embedding_mask', 'encoder_hidden_states_t5', 'text_embedding_mask_t5', 'image_meta_size', 'style', 'cos_cis_img', 'sin_cis_img']
-    control = ControlNet(control_model, compression_ratio=1, latent_format=latent_format, load_device=load_device, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds, strength_type=StrengthType.CONSTANT)
+    control = ControlNet(load_device, offload_device, control_model, compression_ratio=1, latent_format=latent_format, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds, strength_type=StrengthType.CONSTANT)
     return control
 
-def load_controlnet_flux_xlabs_mistoline(sd, mistoline=False, model_options={}):
-    model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(sd, model_options=model_options)
+def load_controlnet_flux_xlabs_mistoline(sd, load_device, mistoline=False, model_options={}):
+    model_config, operations, _, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(sd, load_device, model_options=model_options)
     control_model = comfy.ldm.flux.controlnet.ControlNetFlux(mistoline=mistoline, operations=operations, device=offload_device, dtype=unet_dtype, **model_config.unet_config)
     sd = model_config.process_unet_state_dict(sd)
     control_model = controlnet_load_state_dict(control_model, sd)
     extra_conds = ['y', 'guidance']
-    control = ControlNet(control_model, load_device=load_device, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds)
+    control = ControlNet(load_device, offload_device, control_model, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds)
     return control
 
-def load_controlnet_flux_instantx(sd, model_options={}):
+def load_controlnet_flux_instantx(sd, load_device, model_options={}):
     new_sd = comfy.model_detection.convert_diffusers_mmdit(sd, "")
-    model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(new_sd, model_options=model_options)
+    model_config, operations, _, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(new_sd, load_device, model_options=model_options)
     for k in sd:
         new_sd[k] = sd[k]
 
@@ -655,11 +671,11 @@ def load_controlnet_flux_instantx(sd, model_options={}):
 
     latent_format = comfy.latent_formats.Flux()
     extra_conds = ['y', 'guidance']
-    control = ControlNet(control_model, compression_ratio=1, latent_format=latent_format, concat_mask=concat_mask, load_device=load_device, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds)
+    control = ControlNet(load_device, offload_device, control_model, compression_ratio=1, latent_format=latent_format, concat_mask=concat_mask, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds)
     return control
 
-def load_controlnet_qwen_instantx(sd, model_options={}):
-    model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(sd, model_options=model_options)
+def load_controlnet_qwen_instantx(sd, load_device, model_options={}):
+    model_config, operations, _, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(sd, load_device, model_options=model_options)
     control_latent_channels = sd.get("controlnet_x_embedder.weight").shape[1]
 
     extra_condition_channels = 0
@@ -671,15 +687,14 @@ def load_controlnet_qwen_instantx(sd, model_options={}):
     control_model = controlnet_load_state_dict(control_model, sd)
     latent_format = comfy.latent_formats.Wan21()
     extra_conds = []
-    control = ControlNet(control_model, compression_ratio=1, latent_format=latent_format, concat_mask=concat_mask, load_device=load_device, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds)
+    control = ControlNet(load_device, offload_device, control_model, compression_ratio=1, latent_format=latent_format, concat_mask=concat_mask, manual_cast_dtype=manual_cast_dtype, extra_conds=extra_conds)
     return control
 
 
-def load_controlnet_qwen_fun(sd, model_options={}):
-    load_device = comfy.model_management.get_torch_device()
+def load_controlnet_qwen_fun(sd, device, model_options={}):
     weight_dtype = comfy.utils.weight_dtype(sd)
     unet_dtype = model_options.get("dtype", weight_dtype)
-    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, load_device)
+    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, device)
 
     operations = model_options.get("custom_operations", None)
     if operations is None:
@@ -692,6 +707,8 @@ def load_controlnet_qwen_fun(sd, model_options={}):
     attention_head_dim = sd["control_blocks.0.attn.norm_q.weight"].shape[0]
     num_attention_heads = max(1, block_weight.shape[0] // max(1, attention_head_dim))
 
+    offload_device = comfy.model_management.unet_offload_device(device)
+
     model = comfy.ldm.qwen_image.controlnet.QwenImageFunControlNetModel(
         control_in_features=in_features,
         inner_dim=inner_dim,
@@ -701,13 +718,15 @@ def load_controlnet_qwen_fun(sd, model_options={}):
         main_model_double=60,
         injection_layers=(0, 12, 24, 36, 48),
         operations=operations,
-        device=comfy.model_management.unet_offload_device(),
+        device=offload_device,
         dtype=unet_dtype,
     )
     model = controlnet_load_state_dict(model, sd)
 
     latent_format = comfy.latent_formats.Wan21()
     control = QwenFunControlNet(
+        device,
+        offload_device,
         model,
         compression_ratio=1,
         latent_format=latent_format,
@@ -715,7 +734,6 @@ def load_controlnet_qwen_fun(sd, model_options={}):
         # Enabling generic concat_mask injects an extra mask channel at apply-time
         # and breaks the intended fallback packing path.
         concat_mask=False,
-        load_device=load_device,
         manual_cast_dtype=manual_cast_dtype,
         extra_conds=[],
     )
@@ -725,10 +743,11 @@ def convert_mistoline(sd):
     return comfy.utils.state_dict_prefix_replace(sd, {"single_controlnet_blocks.": "controlnet_single_blocks."})
 
 
-def load_controlnet_state_dict(state_dict, model=None, model_options={}):
+def load_controlnet_state_dict(state_dict, device, model=None, model_options={}):
+    offload_device = comfy.model_management.unet_offload_device(device)
     controlnet_data = state_dict
     if 'after_proj_list.18.bias' in controlnet_data.keys(): #Hunyuan DiT
-        return load_controlnet_hunyuandit(controlnet_data, model_options=model_options)
+        return load_controlnet_hunyuandit(controlnet_data, device, model_options=model_options)
 
     if "lora_controlnet" in controlnet_data:
         return ControlLora(controlnet_data, model_options=model_options)
@@ -788,21 +807,21 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
         controlnet_data = new_sd
     elif "controlnet_blocks.0.weight" in controlnet_data:
         if "double_blocks.0.img_attn.norm.key_norm.scale" in controlnet_data:
-            return load_controlnet_flux_xlabs_mistoline(controlnet_data, model_options=model_options)
+            return load_controlnet_flux_xlabs_mistoline(controlnet_data, device, model_options=model_options)
         elif "pos_embed_input.proj.weight" in controlnet_data:
             if "transformer_blocks.0.adaLN_modulation.1.bias" in controlnet_data:
-                return load_controlnet_sd35(controlnet_data, model_options=model_options) #Stability sd3.5 format
+                return load_controlnet_sd35(controlnet_data, device, model_options=model_options) #Stability sd3.5 format
             else:
-                return load_controlnet_mmdit(controlnet_data, model_options=model_options) #SD3 diffusers controlnet
+                return load_controlnet_mmdit(controlnet_data, device, model_options=model_options) #SD3 diffusers controlnet
         elif "transformer_blocks.0.img_mlp.net.0.proj.weight" in controlnet_data:
-            return load_controlnet_qwen_instantx(controlnet_data, model_options=model_options)
+            return load_controlnet_qwen_instantx(controlnet_data, device, model_options=model_options)
         elif "controlnet_x_embedder.weight" in controlnet_data:
-            return load_controlnet_flux_instantx(controlnet_data, model_options=model_options)
+            return load_controlnet_flux_instantx(controlnet_data, device, model_options=model_options)
     elif "control_blocks.0.after_proj.weight" in controlnet_data and "control_img_in.weight" in controlnet_data:
-        return load_controlnet_qwen_fun(controlnet_data, model_options=model_options)
+        return load_controlnet_qwen_fun(controlnet_data, device, model_options=model_options)
 
     elif "controlnet_blocks.0.linear.weight" in controlnet_data: #mistoline flux
-        return load_controlnet_flux_xlabs_mistoline(convert_mistoline(controlnet_data), mistoline=True, model_options=model_options)
+        return load_controlnet_flux_xlabs_mistoline(convert_mistoline(controlnet_data), device, mistoline=True, model_options=model_options)
 
     pth_key = 'control_model.zero_convs.0.0.weight'
     pth = False
@@ -814,7 +833,7 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
     elif key in controlnet_data:
         prefix = ""
     else:
-        net = load_t2i_adapter(controlnet_data, model_options=model_options)
+        net = load_t2i_adapter(controlnet_data, device, model_options=model_options)
         if net is None:
             logging.error("error could not detect control model type.")
         return net
@@ -829,20 +848,18 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
         weight_dtype = comfy.utils.weight_dtype(controlnet_data)
 
         if supported_inference_dtypes is None:
-            supported_inference_dtypes = [comfy.model_management.unet_dtype()]
+            supported_inference_dtypes = [comfy.model_management.unet_dtype(device)]
 
-        unet_dtype = comfy.model_management.unet_dtype(model_params=-1, supported_dtypes=supported_inference_dtypes, weight_dtype=weight_dtype)
+        unet_dtype = comfy.model_management.unet_dtype(device, model_params=-1, supported_dtypes=supported_inference_dtypes, weight_dtype=weight_dtype)
 
-    load_device = comfy.model_management.get_torch_device()
-
-    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, load_device)
+    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, device)
     operations = model_options.get("custom_operations", None)
     if operations is None:
         operations = comfy.ops.pick_operations(unet_dtype, manual_cast_dtype)
 
     controlnet_config["operations"] = operations
     controlnet_config["dtype"] = unet_dtype
-    controlnet_config["device"] = comfy.model_management.unet_offload_device()
+    controlnet_config["device"] = offload_device
     controlnet_config.pop("out_channels")
     controlnet_config["hint_channels"] = controlnet_data["{}input_hint_block.0.weight".format(prefix)].shape[1]
     control_model = comfy.cldm.cldm.ControlNet(**controlnet_config)
@@ -877,31 +894,29 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
         logging.debug("unexpected controlnet keys: {}".format(unexpected))
 
     global_average_pooling = model_options.get("global_average_pooling", False)
-    control = ControlNet(control_model, global_average_pooling=global_average_pooling, load_device=load_device, manual_cast_dtype=manual_cast_dtype)
+    control = ControlNet(device, offload_device, control_model, global_average_pooling=global_average_pooling, manual_cast_dtype=manual_cast_dtype)
     return control
 
-def load_controlnet(ckpt_path, model=None, model_options={}):
+def load_controlnet(ckpt_path, device, model=None, model_options={}):
     model_options = model_options.copy()
     if "global_average_pooling" not in model_options:
         filename = os.path.splitext(ckpt_path)[0]
         if filename.endswith("_shuffle") or filename.endswith("_shuffle_fp16"): #TODO: smarter way of enabling global_average_pooling
             model_options["global_average_pooling"] = True
 
-    cnet = load_controlnet_state_dict(comfy.utils.load_torch_file(ckpt_path, safe_load=True), model=model, model_options=model_options)
+    cnet = load_controlnet_state_dict(comfy.utils.load_torch_file(ckpt_path, safe_load=True), device, model=model, model_options=model_options)
     if cnet is None:
         logging.error("error checkpoint does not contain controlnet or t2i adapter data {}".format(ckpt_path))
     return cnet
 
 class T2IAdapter(ControlBase):
-    def __init__(self, t2i_model, channels_in, compression_ratio, upscale_algorithm, device=None):
+    def __init__(self, t2i_model, channels_in, compression_ratio, upscale_algorithm, device):
         super().__init__()
         self.t2i_model = t2i_model
         self.channels_in = channels_in
         self.control_input = None
         self.compression_ratio = compression_ratio
         self.upscale_algorithm = upscale_algorithm
-        if device is None:
-            device = comfy.model_management.get_torch_device()
         self.device = device
 
     def scale_image_to(self, width, height):
@@ -946,7 +961,7 @@ class T2IAdapter(ControlBase):
         return self.control_merge(control_input, control_prev, x_noisy.dtype)
 
     def copy(self):
-        c = T2IAdapter(self.t2i_model, self.channels_in, self.compression_ratio, self.upscale_algorithm)
+        c = T2IAdapter(self.t2i_model, self.channels_in, self.compression_ratio, self.upscale_algorithm, self.device)
         self.copy_to(c)
         return c
 
@@ -958,7 +973,7 @@ class T2IAdapter(ControlBase):
             self.multigpu_clones[load_device] = c
         return c
 
-def load_t2i_adapter(t2i_data, model_options={}): #TODO: model_options
+def load_t2i_adapter(t2i_data, device, model_options={}): #TODO: model_options
     compression_ratio = 8
     upscale_algorithm = 'nearest-exact'
 
@@ -1007,4 +1022,4 @@ def load_t2i_adapter(t2i_data, model_options={}): #TODO: model_options
     if len(unexpected) > 0:
         logging.debug("t2i unexpected {}".format(unexpected))
 
-    return T2IAdapter(model_ad, model_ad.input_channels, compression_ratio, upscale_algorithm)
+    return T2IAdapter(model_ad, model_ad.input_channels, compression_ratio, upscale_algorithm, device)

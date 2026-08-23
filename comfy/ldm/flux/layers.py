@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
+from comfy.ldm.modules.attention import optimized_attention_for_device
+
 from .math import attention, rope
 
 # Fix import for some custom nodes, TODO: delete eventually.
@@ -161,7 +163,7 @@ class SiLUActivation(nn.Module):
 
 
 class DoubleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, modulation=True, mlp_silu_act=False, proj_bias=True, yak_mlp=False, dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, modulation=True, mlp_silu_act=False, proj_bias=True, yak_mlp=False, dtype=None, operations=None):
         super().__init__()
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -188,6 +190,8 @@ class DoubleStreamBlock(nn.Module):
         self.txt_norm2 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
 
         self.txt_mlp = build_mlp(hidden_size, mlp_hidden_dim, mlp_silu_act=mlp_silu_act, yak_mlp=yak_mlp, dtype=dtype, device=device, operations=operations)
+
+        self.oa = optimized_attention_for_device(device)
 
     def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims_img=None, modulation_dims_txt=None, transformer_options={}):
         if self.modulation:
@@ -232,7 +236,7 @@ class DoubleStreamBlock(nn.Module):
                 q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
         # run actual attention
-        attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+        attn = attention(self.oa, q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
         del q, k, v
 
         if "attn1_output_patch" in transformer_patches:
@@ -266,6 +270,7 @@ class SingleStreamBlock(nn.Module):
 
     def __init__(
         self,
+        device,
         hidden_size: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
@@ -275,7 +280,6 @@ class SingleStreamBlock(nn.Module):
         bias=True,
         yak_mlp=False,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -313,6 +317,8 @@ class SingleStreamBlock(nn.Module):
         else:
             self.modulation = None
 
+        self.oa = optimized_attention_for_device(device)
+
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, transformer_options={}) -> Tensor:
         if self.modulation:
             mod, _ = self.modulation(vec)
@@ -335,7 +341,7 @@ class SingleStreamBlock(nn.Module):
                 q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
         # compute attention
-        attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+        attn = attention(self.oa, q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
         del q, k, v
 
         if "attn1_output_patch" in transformer_patches:

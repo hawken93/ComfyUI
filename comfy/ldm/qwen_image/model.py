@@ -6,14 +6,14 @@ from typing import Optional, Tuple
 from einops import repeat
 
 from comfy.ldm.lightricks.model import TimestepEmbedding, Timesteps
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.layers import EmbedND
 import comfy.ldm.common_dit
 import comfy.patcher_extension
 from comfy.ldm.flux.math import apply_rope1
 
 class GELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, dtype=None, device=None, operations=None):
+    def __init__(self, dim_in: int, dim_out: int, device, approximate: str = "none", bias: bool = True, dtype=None, operations=None):
         super().__init__()
         self.proj = operations.Linear(dim_in, dim_out, bias=bias, dtype=dtype, device=device)
         self.approximate = approximate
@@ -28,12 +28,13 @@ class FeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
+        device,
         dim_out: Optional[int] = None,
         mult: int = 4,
         dropout: float = 0.0,
         inner_dim=None,
         bias: bool = True,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
         if inner_dim is None:
@@ -64,7 +65,7 @@ def apply_rotary_emb(x, freqs_cis):
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
-    def __init__(self, embedding_dim, pooled_projection_dim, use_additional_t_cond=False, dtype=None, device=None, operations=None):
+    def __init__(self, embedding_dim, pooled_projection_dim, device, use_additional_t_cond=False, dtype=None, operations=None):
         super().__init__()
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.timestep_embedder = TimestepEmbedding(
@@ -95,6 +96,7 @@ class Attention(nn.Module):
     def __init__(
         self,
         query_dim: int,
+        device,
         dim_head: int = 64,
         heads: int = 8,
         dropout: float = 0.0,
@@ -104,7 +106,6 @@ class Attention(nn.Module):
         out_dim: int = None,
         out_context_dim: int = None,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -138,6 +139,8 @@ class Attention(nn.Module):
             nn.Dropout(dropout)
         ])
         self.to_add_out = operations.Linear(self.inner_dim, self.out_context_dim, bias=out_bias, dtype=dtype, device=device)
+
+        self._attn_fn = optimized_attention_for_device(device)
 
     def forward(
         self,
@@ -189,9 +192,9 @@ class Attention(nn.Module):
         joint_query = apply_rope1(joint_query, image_rotary_emb)
         joint_key = apply_rope1(joint_key, image_rotary_emb)
 
-        joint_hidden_states = optimized_attention_masked(joint_query, joint_key, joint_value, self.heads,
-                                                         attn_mask, transformer_options=transformer_options,
-                                                         skip_reshape=True)
+        joint_hidden_states = self._attn_fn(joint_query, joint_key, joint_value, self.heads,
+                                            mask=attn_mask, skip_reshape=True,
+                                            transformer_options=transformer_options)
 
         txt_attn_output = joint_hidden_states[:, :seq_txt, :]
         img_attn_output = joint_hidden_states[:, seq_txt:, :]
@@ -207,11 +210,11 @@ class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
         dim: int,
+        device,
         num_attention_heads: int,
         attention_head_dim: int,
         eps: float = 1e-6,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -321,10 +324,11 @@ class LastLayer(nn.Module):
         self,
         embedding_dim: int,
         conditioning_embedding_dim: int,
+        device,
         elementwise_affine=False,
         eps=1e-6,
         bias=True,
-        dtype=None, device=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
         self.silu = nn.SiLU()
@@ -341,6 +345,7 @@ class LastLayer(nn.Module):
 class QwenImageTransformer2DModel(nn.Module):
     def __init__(
         self,
+        device,
         patch_size: int = 2,
         in_channels: int = 64,
         out_channels: Optional[int] = 16,
@@ -355,7 +360,6 @@ class QwenImageTransformer2DModel(nn.Module):
         final_layer=True,
         use_additional_t_cond=False,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
