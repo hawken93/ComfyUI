@@ -18,13 +18,13 @@ import comfy.ldm.common_dit
 import comfy.utils
 from comfy.ldm.flux.layers import EmbedND, timestep_embedding
 from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 class RMSNorm(nn.Module):
     """RMSNorm with the reference ``(1 + scale)`` weight convention (scale stored zero-centered)."""
 
-    def __init__(self, features: int, eps: float = 1e-5, device=None, dtype=None, operations=None):
+    def __init__(self, device, features: int, eps: float = 1e-5, dtype=None):
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.empty(features, device=device, dtype=dtype))
@@ -36,18 +36,18 @@ class RMSNorm(nn.Module):
 
 
 class QKNorm(nn.Module):
-    def __init__(self, dim: int, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim: int, dtype=None):
         super().__init__()
-        self.qnorm = RMSNorm(dim, device=device, dtype=dtype, operations=operations)
-        self.knorm = RMSNorm(dim, device=device, dtype=dtype, operations=operations)
+        self.qnorm = RMSNorm(device, dim, dtype=dtype)
+        self.knorm = RMSNorm(device, dim, dtype=dtype)
 
     def forward(self, q, k):
         return self.qnorm(q), self.knorm(k)
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, features: int, multiplier: int, bias: bool = False, multiple: int = 128,
-                 device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, features: int, multiplier: int, bias: bool = False, multiple: int = 128,
+                 dtype=None):
         super().__init__()
         mlpdim = int(2 * features / 3) * multiplier
         mlpdim = multiple * ((mlpdim + multiple - 1) // multiple)
@@ -60,9 +60,11 @@ class SwiGLU(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int, kvheads: Optional[int] = None, bias: bool = False,
-                 device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, dim: int, heads: int, kvheads: Optional[int] = None, bias: bool = False,
+                 need_mask=False, dtype=None):
         super().__init__()
+        self.need_mask = need_mask
+        self.optimized_attention = optimized_attention_for_device(device, need_mask=need_mask)
         self.heads = heads
         self.kvheads = kvheads if kvheads is not None else heads
         self.headdim = dim // self.heads
@@ -70,7 +72,7 @@ class Attention(nn.Module):
         self.wk = operations.Linear(dim, self.headdim * self.kvheads, bias=bias, device=device, dtype=dtype)
         self.wv = operations.Linear(dim, self.headdim * self.kvheads, bias=bias, device=device, dtype=dtype)
         self.gate = operations.Linear(dim, dim, bias=bias, device=device, dtype=dtype)
-        self.qknorm = QKNorm(self.headdim, device=device, dtype=dtype, operations=operations)
+        self.qknorm = QKNorm(device, self.headdim, dtype=dtype)
         self.wo = operations.Linear(dim, dim, bias=bias, device=device, dtype=dtype)
 
     def forward(self, x, freqs=None, mask=None, transformer_options={}):
@@ -94,8 +96,10 @@ class Attention(nn.Module):
             rep = self.heads // self.kvheads
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
-        out = optimized_attention_masked(q, k, v, self.heads, mask=mask, skip_reshape=True,
-                                         transformer_options=transformer_options)
+        if mask is not None:
+            assert self.need_mask, "mask was passed, but need_mask is False. Make sure need_mask=True if mask will be used"
+        out = self.optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True,
+                                       transformer_options=transformer_options)
 
         if "block_index" in transformer_options and "attn1_output_patch" in transformer_patches:
             for p in transformer_patches["attn1_output_patch"]:
@@ -105,7 +109,7 @@ class Attention(nn.Module):
 
 
 class SimpleModulation(nn.Module):
-    def __init__(self, dim: int, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim: int, dtype=None):
         super().__init__()
         self.lin = nn.Parameter(torch.empty(2, dim, device=device, dtype=dtype))
 
@@ -116,7 +120,7 @@ class SimpleModulation(nn.Module):
 
 
 class DoubleSharedModulation(nn.Module):
-    def __init__(self, dim: int, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim: int, dtype=None):
         super().__init__()
         self.lin = nn.Parameter(torch.empty(6 * dim, device=device, dtype=dtype))
 
@@ -126,12 +130,12 @@ class DoubleSharedModulation(nn.Module):
 
 
 class TextFusionBlock(nn.Module):
-    def __init__(self, features, heads, multiplier, bias=False, kvheads=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, features, heads, multiplier, bias=False, kvheads=None, need_mask=False, dtype=None):
         super().__init__()
-        self.prenorm = RMSNorm(features, device=device, dtype=dtype, operations=operations)
-        self.postnorm = RMSNorm(features, device=device, dtype=dtype, operations=operations)
-        self.attn = Attention(features, heads, kvheads=kvheads, bias=bias, device=device, dtype=dtype, operations=operations)
-        self.mlp = SwiGLU(features, multiplier, bias, device=device, dtype=dtype, operations=operations)
+        self.prenorm = RMSNorm(device, features, dtype=dtype)
+        self.postnorm = RMSNorm(device, features, dtype=dtype)
+        self.attn = Attention(device, operations, features, heads, kvheads=kvheads, bias=bias, need_mask=need_mask, dtype=dtype)
+        self.mlp = SwiGLU(device, operations, features, multiplier, bias, dtype=dtype)
 
     def forward(self, x, mask=None, transformer_options={}):
         x = x + self.attn(self.prenorm(x), mask=mask, transformer_options=transformer_options)
@@ -140,15 +144,15 @@ class TextFusionBlock(nn.Module):
 
 
 class TextFusionTransformer(nn.Module):
-    def __init__(self, num_txt_layers, txt_dim, heads, multiplier, bias=False, kvheads=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, num_txt_layers, txt_dim, heads, multiplier, bias=False, kvheads=None, need_mask=False, dtype=None):
         super().__init__()
         self.layerwise_blocks = nn.ModuleList([
-            TextFusionBlock(txt_dim, heads, multiplier, bias, kvheads, device=device, dtype=dtype, operations=operations)
+            TextFusionBlock(device, operations, txt_dim, heads, multiplier, bias, kvheads, need_mask=need_mask, dtype=dtype)
             for _ in range(2)
         ])
         self.projector = operations.Linear(num_txt_layers, 1, bias=False, device=device, dtype=dtype)
         self.refiner_blocks = nn.ModuleList([
-            TextFusionBlock(txt_dim, heads, multiplier, bias, kvheads, device=device, dtype=dtype, operations=operations)
+            TextFusionBlock(device, operations, txt_dim, heads, multiplier, bias, kvheads, need_mask=need_mask, dtype=dtype)
             for _ in range(2)
         ])
 
@@ -156,6 +160,7 @@ class TextFusionTransformer(nn.Module):
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
+            # AI finding: mask=None is correct here; these blocks attend over the txtlayers tokens (all always present), not over the sequence. Sequence masks only apply to the refiner blocks below.
             x = block(x.contiguous(), mask=None, transformer_options=transformer_options)
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
         x = self.projector(x).squeeze(-1)
@@ -165,13 +170,13 @@ class TextFusionTransformer(nn.Module):
 
 
 class SingleStreamBlock(nn.Module):
-    def __init__(self, features, heads, multiplier, bias=False, kvheads=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, features, heads, multiplier, bias=False, kvheads=None, need_mask=False, dtype=None):
         super().__init__()
-        self.mod = DoubleSharedModulation(features, device=device, dtype=dtype, operations=operations)
-        self.prenorm = RMSNorm(features, device=device, dtype=dtype, operations=operations)
-        self.postnorm = RMSNorm(features, device=device, dtype=dtype, operations=operations)
-        self.attn = Attention(features, heads, kvheads=kvheads, bias=bias, device=device, dtype=dtype, operations=operations)
-        self.mlp = SwiGLU(features, multiplier, bias, device=device, dtype=dtype, operations=operations)
+        self.mod = DoubleSharedModulation(device, features, dtype=dtype)
+        self.prenorm = RMSNorm(device, features, dtype=dtype)
+        self.postnorm = RMSNorm(device, features, dtype=dtype)
+        self.attn = Attention(device, operations, features, heads, kvheads=kvheads, bias=bias, need_mask=need_mask, dtype=dtype)
+        self.mlp = SwiGLU(device, operations, features, multiplier, bias, dtype=dtype)
 
     def forward(self, x, vec, freqs, mask=None, timestep_zero_index=None, transformer_options={}):
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
@@ -217,11 +222,11 @@ class SingleStreamBlock(nn.Module):
 
 
 class LastLayer(nn.Module):
-    def __init__(self, features, patch, channels, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, features, patch, channels, dtype=None):
         super().__init__()
-        self.norm = RMSNorm(features, device=device, dtype=dtype, operations=operations)
+        self.norm = RMSNorm(device, features, dtype=dtype)
         self.linear = operations.Linear(features, patch * patch * channels, bias=True, device=device, dtype=dtype)
-        self.modulation = SimpleModulation(features, device=device, dtype=dtype, operations=operations)
+        self.modulation = SimpleModulation(device, features, dtype=dtype)
 
     def forward(self, x, tvec):
         scale, shift = self.modulation(tvec)
@@ -230,10 +235,10 @@ class LastLayer(nn.Module):
 
 
 class SingleStreamDiT(nn.Module):
-    def __init__(self, device, features=6144, tdim=256, txtdim=2560, heads=48, kvheads=12, multiplier=4,
+    def __init__(self, device, operations, features=6144, tdim=256, txtdim=2560, heads=48, kvheads=12, multiplier=4,
                  layers=28, patch=2, channels=16, bias=False, theta=1e3, txtlayers=12,
-                 txtheads=20, txtkvheads=20, default_ref_method=None, image_model=None,
-                 dtype=None, operations=None, **kwargs):
+                 txtheads=20, txtkvheads=20, default_ref_method=None, need_mask=False,
+                 dtype=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         self.patch = patch
@@ -251,7 +256,7 @@ class SingleStreamDiT(nn.Module):
 
         self.first = operations.Linear(channels * patch ** 2, features, bias=True, device=device, dtype=dtype)
         self.blocks = nn.ModuleList([
-            SingleStreamBlock(features, heads, multiplier, bias, kvheads, device=device, dtype=dtype, operations=operations)
+            SingleStreamBlock(device, operations, features, heads, multiplier, bias, kvheads, need_mask=need_mask, dtype=dtype)
             for _ in range(layers)
         ])
         self.tmlp = nn.Sequential(
@@ -259,26 +264,26 @@ class SingleStreamDiT(nn.Module):
             nn.GELU(approximate="tanh"),
             operations.Linear(features, features, device=device, dtype=dtype),
         )
-        self.txtfusion = TextFusionTransformer(txtlayers, txtdim, txtheads, multiplier, bias, txtkvheads,
-                                               device=device, dtype=dtype, operations=operations)
+        self.txtfusion = TextFusionTransformer(device, operations, txtlayers, txtdim, txtheads, multiplier, bias, txtkvheads,
+                                               need_mask=need_mask, dtype=dtype)
         self.txtmlp = nn.Sequential(
-            RMSNorm(txtdim, device=device, dtype=dtype, operations=operations),
+            RMSNorm(device, txtdim, dtype=dtype),
             operations.Linear(txtdim, features, device=device, dtype=dtype),
             nn.GELU(approximate="tanh"),
             operations.Linear(features, features, device=device, dtype=dtype),
         )
-        self.last = LastLayer(features, patch, channels, device=device, dtype=dtype, operations=operations)
+        self.last = LastLayer(device, operations, features, patch, channels, dtype=dtype)
         self.tproj = nn.Sequential(
             nn.GELU(approximate="tanh"),
             operations.Linear(features, features * 6, device=device, dtype=dtype),
         )
 
-    def forward(self, x, timesteps, context, attention_mask=None, ref_latents=None, transformer_options={}, **kwargs):
+    def forward(self, x, timesteps, context, mask=None, ref_latents=None, transformer_options={}, **kwargs):
         return comfy.patcher_extension.WrapperExecutor.new_class_executor(
             self._forward,
             self,
             comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options),
-        ).execute(x, timesteps, context, attention_mask, ref_latents, transformer_options, **kwargs)
+        ).execute(x, timesteps, context, mask, ref_latents, transformer_options, **kwargs)
 
     def process_img(self, x, index=0):
         patch = self.patch
@@ -292,7 +297,7 @@ class SingleStreamDiT(nn.Module):
         img_ids[..., 2] = torch.arange(w, device=x.device, dtype=torch.float32)[None, :]
         return img, img_ids.reshape(1, h * w, 3).repeat(x.shape[0], 1, 1), h, w
 
-    def _forward(self, x, timesteps, context, attention_mask=None, ref_latents=None, transformer_options={}, **kwargs):
+    def _forward(self, x, timesteps, context, mask=None, ref_latents=None, transformer_options={}, **kwargs):
         transformer_options = transformer_options.copy()
         temporal = x.ndim == 5
         if temporal:
@@ -336,7 +341,7 @@ class SingleStreamDiT(nn.Module):
             t0 = self.tmlp(timestep_embedding(torch.zeros_like(timesteps), self.tdim).unsqueeze(1).to(img.dtype))
             tvec = torch.cat((tvec, self.tproj(t0)), dim=0)
 
-        context = self.txtfusion(context, mask=None, transformer_options=transformer_options)
+        context = self.txtfusion(context, mask, transformer_options=transformer_options)
         context = self.txtmlp(context)
 
         txtlen = context.shape[1]

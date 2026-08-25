@@ -1,7 +1,5 @@
 import torch
 
-from comfy.ldm.modules import attention as _attention
-
 
 def _var_attention_qkv(q, k, v, heads, skip_reshape):
     if skip_reshape:
@@ -22,7 +20,7 @@ def _var_attention_output(out, heads, head_dim, skip_output_reshape):
     return out.reshape(-1, heads * head_dim)
 
 
-def var_attention_optimized_split(q, k, v, heads, cu_seqlens_q, cu_seqlens_k, *args, skip_reshape=False, skip_output_reshape=False, **kwargs):
+def var_attention_optimized_split(optimized_attention, q, k, v, heads, cu_seqlens_q, cu_seqlens_k, *args, skip_reshape=False, skip_output_reshape=False, **kwargs):
     q, k, v, head_dim = _var_attention_qkv(q, k, v, heads, skip_reshape)
 
     q_split_indices = cu_seqlens_q[1:-1]
@@ -41,7 +39,7 @@ def var_attention_optimized_split(q, k, v, heads, cu_seqlens_q, cu_seqlens_k, *a
         q_i = q_i.permute(1, 0, 2).unsqueeze(0)
         k_i = k_i.permute(1, 0, 2).unsqueeze(0)
         v_i = v_i.permute(1, 0, 2).unsqueeze(0)
-        out_i = _attention.optimized_attention(q_i, k_i, v_i, heads, skip_reshape=True, skip_output_reshape=True)
+        out_i = optimized_attention(q_i, k_i, v_i, heads, skip_reshape=True, skip_output_reshape=True)
         out.append(out_i.squeeze(0).permute(1, 0, 2))
 
     out = torch.cat(out, dim=0)

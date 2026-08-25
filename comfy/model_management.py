@@ -450,19 +450,19 @@ else:
     except ImportError:
         XFORMERS_IS_AVAILABLE = False
 
-def is_nvidia(dev):
+def is_nvidia(dev: torch.device):
     # version.cuda/.hip are build flags, so this assumes a single cuda-vendor per process.
-    if torch.device(dev).type != "cuda":
+    if dev.type != "cuda":
         return False
     return bool(torch.version.cuda)
 
-def is_amd(dev):
+def is_amd(dev: torch.device):
     # see is_nvidia: assumes a single cuda-vendor per process.
-    if torch.device(dev).type != "cuda":
+    if dev.type != "cuda":
         return False
     return bool(torch.version.hip)
 
-def amd_min_version(device, min_rdna_version=0):
+def amd_min_version(device: torch.device, min_rdna_version=0):
     if not is_amd(device):
         return False
 
@@ -477,7 +477,7 @@ def amd_min_version(device, min_rdna_version=0):
 
     return False
 
-def min_weight_memory_ratio(device):
+def min_weight_memory_ratio(device: torch.device):
     if is_nvidia(device):
         return 0.0
     return 0.4

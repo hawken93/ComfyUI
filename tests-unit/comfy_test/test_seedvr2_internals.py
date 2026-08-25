@@ -14,7 +14,6 @@ if not torch.cuda.is_available():
 
 import comfy.ldm.seedvr.model as seedvr_model  # noqa: E402
 import comfy.ldm.seedvr.vae as vae_mod  # noqa: E402
-import comfy.ldm.modules.attention as attention  # noqa: E402
 import comfy.ops as comfy_ops  # noqa: E402
 from comfy.ldm.seedvr.vae import (  # noqa: E402
     causal_norm_wrapper,
@@ -91,7 +90,7 @@ def test_seedvr2_7b_swin_attention_forward_uses_optimized_var_attention(monkeypa
         window=(2, 1, 1),
         window_method="720pwin_by_size_bysize",
         version=True,
-        device="cpu",
+        device=torch.device("cpu"),
         dtype=torch.float32,
         operations=comfy_ops.disable_weight_init,
     )
@@ -102,7 +101,7 @@ def test_seedvr2_7b_swin_attention_forward_uses_optimized_var_attention(monkeypa
     txt_shape = torch.tensor([[3]], dtype=torch.long)
     calls = []
 
-    def fake_optimized_var_attention(**kwargs):
+    def fake_optimized_var_attention(backend, **kwargs):
         calls.append(kwargs)
         return kwargs["q"]
 
@@ -145,9 +144,8 @@ def test_var_attention_optimized_split_calls_dense_backend_per_window(monkeypatc
         )
         return q_arg + v_arg
 
-    monkeypatch.setattr(attention, "optimized_attention", fake_optimized_attention)
-
     out = var_attention_optimized_split(
+        fake_optimized_attention,
         q,
         k,
         v,

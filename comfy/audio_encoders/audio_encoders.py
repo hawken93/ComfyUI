@@ -14,16 +14,11 @@ class AudioEncoderModel():
         self.dtype = comfy.model_management.text_encoder_dtype(self.load_device)
         model_type = config.pop("model_type")
         model_config = dict(config)
-        model_config.update({
-            "dtype": self.dtype,
-            "device": offload_device,
-            "operations": comfy.ops.manual_cast
-        })
 
         if model_type == "wav2vec2":
-            self.model = Wav2Vec2Model(**model_config)
+            self.model = Wav2Vec2Model(offload_device, comfy.ops.manual_cast, dtype=self.dtype, **model_config)
         elif model_type == "whisper3":
-            self.model = WhisperLargeV3(**model_config)
+            self.model = WhisperLargeV3(offload_device, comfy.ops.manual_cast, dtype=self.dtype, **model_config)
         self.model.eval()
         self.patcher = comfy.model_patcher.CoreModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
         self.model_sample_rate = 16000

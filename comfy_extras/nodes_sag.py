@@ -5,7 +5,7 @@ import math
 from typing_extensions import override
 
 from einops import rearrange, repeat
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.samplers
 from comfy_api.latest import ComfyExtension, io
 
@@ -130,6 +130,7 @@ class SelfAttentionGuidance(io.ComfyNode):
         m = model.clone()
 
         attn_scores = None
+        optimized_attention = optimized_attention_for_device(model.load_device)
 
         # TODO: make this work properly with chunked batches
         #       currently, we can only save the attn from one UNet call

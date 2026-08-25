@@ -17,7 +17,7 @@ import comfy.ops
 import comfy.patcher_extension
 import comfy.quant_ops
 from comfy.ldm.lumina.model import FeedForward
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.text_encoders.llama import precompute_freqs_cis
 
 # Per-token role indicators
@@ -45,11 +45,12 @@ def _apply_rope_split_half1(x, freqs_cis):
 
 
 class Ideogram4Attention(nn.Module):
-    def __init__(self, hidden_size, num_heads, eps=1e-5, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, num_heads, eps=1e-5, dtype=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.hidden_size = hidden_size
+        self.optimized_attention = optimized_attention_for_device(device, need_mask=True)
 
         self.qkv = operations.Linear(hidden_size, hidden_size * 3, bias=False, dtype=dtype, device=device)
         self.norm_q = operations.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True, dtype=dtype, device=device)
@@ -78,14 +79,14 @@ class Ideogram4Attention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        out = optimized_attention_masked(q, k, v, self.num_heads, attn_mask, skip_reshape=True, transformer_options=transformer_options)
+        out = self.optimized_attention(q, k, v, self.num_heads, attn_mask, skip_reshape=True, transformer_options=transformer_options)
         return self.o(out)
 
 
 class Ideogram4TransformerBlock(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_heads, norm_eps, adaln_dim, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, intermediate_size, num_heads, norm_eps, adaln_dim, dtype=None):
         super().__init__()
-        self.attention = Ideogram4Attention(hidden_size, num_heads, eps=1e-5, dtype=dtype, device=device, operations=operations)
+        self.attention = Ideogram4Attention(device, operations, hidden_size, num_heads, eps=1e-5, dtype=dtype)
         self.feed_forward = FeedForward(device, operations, hidden_size, intermediate_size, 1, None, dtype=dtype)
 
         self.attention_norm1 = operations.RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=True, dtype=dtype, device=device)
@@ -122,7 +123,7 @@ def _sinusoidal_embedding(t, dim, scale=1e4):
 
 
 class Ideogram4EmbedScalar(nn.Module):
-    def __init__(self, dim, input_range=(0.0, 1.0), dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, dim, input_range=(0.0, 1.0), dtype=None):
         super().__init__()
         self.dim = dim
         self.range_min, self.range_max = input_range
@@ -139,7 +140,7 @@ class Ideogram4EmbedScalar(nn.Module):
 
 
 class Ideogram4FinalLayer(nn.Module):
-    def __init__(self, hidden_size, out_channels, adaln_dim, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, out_channels, adaln_dim, dtype=None):
         super().__init__()
         self.norm_final = operations.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, out_channels, bias=True, dtype=dtype, device=device)
@@ -153,9 +154,9 @@ class Ideogram4FinalLayer(nn.Module):
 class Ideogram4Transformer(nn.Module):
     """A single Ideogram 4 backbone operating on a packed token sequence."""
 
-    def __init__(self, emb_dim, num_layers, num_heads, intermediate_size, adaln_dim,
+    def __init__(self, device, operations, emb_dim, num_layers, num_heads, intermediate_size, adaln_dim,
                  in_channels, llm_features_dim, rope_theta, mrope_section, norm_eps,
-                 dtype=None, device=None, operations=None):
+                 dtype=None):
         super().__init__()
         self.head_dim = emb_dim // num_heads
         self.rope_theta = rope_theta
@@ -164,18 +165,18 @@ class Ideogram4Transformer(nn.Module):
         self.input_proj = operations.Linear(in_channels, emb_dim, bias=True, dtype=dtype, device=device)
         self.llm_cond_norm = operations.RMSNorm(llm_features_dim, eps=1e-6, elementwise_affine=True, dtype=dtype, device=device)
         self.llm_cond_proj = operations.Linear(llm_features_dim, emb_dim, bias=True, dtype=dtype, device=device)
-        self.t_embedding = Ideogram4EmbedScalar(emb_dim, input_range=(0.0, 1.0), dtype=dtype, device=device, operations=operations)
+        self.t_embedding = Ideogram4EmbedScalar(device, operations, emb_dim, input_range=(0.0, 1.0), dtype=dtype)
         self.adaln_proj = operations.Linear(emb_dim, adaln_dim, bias=True, dtype=dtype, device=device)
 
         self.embed_image_indicator = operations.Embedding(2, emb_dim, dtype=dtype, device=device)
 
         self.layers = nn.ModuleList([
-            Ideogram4TransformerBlock(emb_dim, intermediate_size, num_heads, norm_eps, adaln_dim,
-                                      dtype=dtype, device=device, operations=operations)
+            Ideogram4TransformerBlock(device, operations, emb_dim, intermediate_size, num_heads, norm_eps, adaln_dim,
+                                      dtype=dtype)
             for _ in range(num_layers)
         ])
 
-        self.final_layer = Ideogram4FinalLayer(emb_dim, in_channels, adaln_dim, dtype=dtype, device=device, operations=operations)
+        self.final_layer = Ideogram4FinalLayer(device, operations, emb_dim, in_channels, adaln_dim, dtype=dtype)
 
     def _backbone(self, llm_features, x, t, position_ids, attn_mask, indicator, transformer_options={}):
         indicator = indicator.to(torch.long)
@@ -221,15 +222,15 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
     Runs a packed ``[text, image]`` sequence when text context is supplied, or an image-only sequence when ``context is None``.
     """
 
-    def __init__(self, device, image_model=None, in_channels=128, num_layers=34, num_attention_heads=18, attention_head_dim=256, intermediate_size=12288,
+    def __init__(self, device, operations, in_channels=128, num_layers=34, num_attention_heads=18, attention_head_dim=256, intermediate_size=12288,
                  adaln_dim=512, llm_features_dim=53248, rope_theta=5000000, mrope_section=(24, 20, 20), norm_eps=1e-5,
-                 dtype=None, operations=None, **kwargs):
+                 dtype=None, **kwargs):
         emb_dim = num_attention_heads * attention_head_dim
         super().__init__(
-            emb_dim=emb_dim, num_layers=num_layers, num_heads=num_attention_heads,
-            intermediate_size=intermediate_size, adaln_dim=adaln_dim, in_channels=in_channels,
-            llm_features_dim=llm_features_dim, rope_theta=rope_theta, mrope_section=mrope_section,
-            norm_eps=norm_eps, dtype=dtype, device=device, operations=operations)
+            device, operations, emb_dim, num_layers, num_attention_heads,
+            intermediate_size, adaln_dim, in_channels,
+            llm_features_dim, rope_theta, mrope_section, norm_eps,
+            dtype=dtype)
         self.dtype = dtype
         self.in_channels = in_channels
         self.out_channels = in_channels

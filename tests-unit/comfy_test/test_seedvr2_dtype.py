@@ -71,7 +71,7 @@ def test_seedvr2_vae_encode_preserves_compute_dtype(monkeypatch):
 
 
 def test_seedvr2_vae_ops_cast_weights_to_compute_dtype():
-    attention = seedvr_vae.Attention(query_dim=4, heads=1, dim_head=4).to(torch.float16)
+    attention = seedvr_vae.Attention(torch.device("cpu"), query_dim=4, heads=1, dim_head=4).to(torch.float16)
     hidden_states = torch.zeros((1, 2, 4), dtype=torch.float32)
 
     output = attention(hidden_states)
