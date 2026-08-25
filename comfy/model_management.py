@@ -1252,6 +1252,21 @@ def text_encoder_dtype(device):
 
 
 def intermediate_device(device):
+    # Device to use for intermediates.
+    # If gpu only, the results may live on that gpu
+    # Otherwise, use cpu.
+    # Also used for streaming large results into CPU etc.
+    # So sometimes should REALLY be cpu.
+
+    # A future model-parallel policy could choose between the caller's devices and CPU.
+    # Either A: use cpu, or
+    #        B: know which devices this intermediate will be between, and check whether
+    #           intermediate on either of them works, or whether it needs to be on cpu.
+
+    # Callers like minimax, that use intermediate as gpu -> cpu -> disk
+    # should pretty much hardcode cpu I think. I read intermediate as typically between
+    # steps. I.e. where the next step also involves an accellerator.
+    # I think for option B, callers can use intermediate(device, cpu) -> cpu.
     if args.gpu_only:
         return device
     else:

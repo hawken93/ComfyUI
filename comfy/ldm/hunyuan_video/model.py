@@ -47,7 +47,7 @@ class HunyuanVideoParams:
 
 
 class SelfAttentionRef(nn.Module):
-    def __init__(self, dim: int, device, qkv_bias: bool = False, dtype=None, operations=None):
+    def __init__(self, device, operations, dim: int, qkv_bias: bool = False, dtype=None):
         super().__init__()
         self.qkv = operations.Linear(dim, dim * 3, bias=qkv_bias, dtype=dtype, device=device)
         self.proj = operations.Linear(dim, dim, dtype=dtype, device=device)
@@ -56,11 +56,11 @@ class SelfAttentionRef(nn.Module):
 class TokenRefinerBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         hidden_size,
         heads,
-        device,
-        dtype=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
         self.heads = heads
@@ -73,7 +73,7 @@ class TokenRefinerBlock(nn.Module):
         )
 
         self.norm1 = operations.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6, dtype=dtype, device=device)
-        self.self_attn = SelfAttentionRef(hidden_size, device, True, dtype=dtype, operations=operations)
+        self.self_attn = SelfAttentionRef(device, operations, hidden_size, True, dtype=dtype)
 
         self.norm2 = operations.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6, dtype=dtype, device=device)
 
@@ -99,22 +99,22 @@ class TokenRefinerBlock(nn.Module):
 class IndividualTokenRefiner(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         hidden_size,
         heads,
         num_blocks,
-        device,
-        dtype=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
             [
                 TokenRefinerBlock(
-                    hidden_size=hidden_size,
-                    heads=heads,
-                    dtype=dtype,
-                    device=device,
-                    operations=operations
+                    device,
+                    operations,
+                    hidden_size,
+                    heads,
+                    dtype=dtype
                 )
                 for _ in range(num_blocks)
             ]
@@ -135,20 +135,20 @@ class IndividualTokenRefiner(nn.Module):
 class TokenRefiner(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         text_dim,
         hidden_size,
         heads,
         num_blocks,
-        device,
-        dtype=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
 
         self.input_embedder = operations.Linear(text_dim, hidden_size, bias=True, dtype=dtype, device=device)
         self.t_embedder = MLPEmbedder(256, hidden_size, dtype=dtype, device=device, operations=operations)
         self.c_embedder = MLPEmbedder(text_dim, hidden_size, dtype=dtype, device=device, operations=operations)
-        self.individual_token_refiner = IndividualTokenRefiner(hidden_size, heads, num_blocks, dtype=dtype, device=device, operations=operations)
+        self.individual_token_refiner = IndividualTokenRefiner(device, operations, hidden_size, heads, num_blocks, dtype=dtype)
 
     def forward(
         self,
@@ -172,7 +172,7 @@ class TokenRefiner(nn.Module):
 
 
 class ByT5Mapper(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim, out_dim1, device, use_res=False, dtype=None, operations=None):
+    def __init__(self, device, operations, in_dim, out_dim, hidden_dim, out_dim1, use_res=False, dtype=None):
         super().__init__()
         self.layernorm = operations.LayerNorm(in_dim, dtype=dtype, device=device)
         self.fc1 = operations.Linear(in_dim, hidden_dim, dtype=dtype, device=device)
@@ -199,7 +199,7 @@ class HunyuanVideo(nn.Module):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, device, image_model=None, final_layer=True, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, operations, image_model=None, final_layer=True, dtype=None, **kwargs):
         super().__init__()
         self.dtype = dtype
 
@@ -221,7 +221,7 @@ class HunyuanVideo(nn.Module):
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
 
-        self.img_in = comfy.ldm.modules.diffusionmodules.mmdit.PatchEmbed(None, self.patch_size, self.in_channels, self.hidden_size, conv3d=len(self.patch_size) == 3, dtype=dtype, device=device, operations=operations)
+        self.img_in = comfy.ldm.modules.diffusionmodules.mmdit.PatchEmbed(device, operations, None, self.patch_size, self.in_channels, self.hidden_size, conv3d=len(self.patch_size) == 3, dtype=dtype)
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations)
         if params.vec_in_dim is not None:
             self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
@@ -232,7 +232,7 @@ class HunyuanVideo(nn.Module):
             MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embed else nn.Identity()
         )
 
-        self.txt_in = TokenRefiner(params.context_in_dim, self.hidden_size, self.num_heads, 2, dtype=dtype, device=device, operations=operations)
+        self.txt_in = TokenRefiner(device, operations, params.context_in_dim, self.hidden_size, self.num_heads, 2, dtype=dtype)
 
         self.double_blocks = nn.ModuleList(
             [
@@ -257,12 +257,14 @@ class HunyuanVideo(nn.Module):
 
         if params.byt5:
             self.byt5_in = ByT5Mapper(
-                in_dim=1472,
-                out_dim=2048,
-                hidden_dim=2048,
-                out_dim1=self.hidden_size,
+                device,
+                operations,
+                1472,
+                2048,
+                2048,
+                self.hidden_size,
                 use_res=False,
-                dtype=dtype, device=device, operations=operations
+                dtype=dtype
             )
         else:
             self.byt5_in = None

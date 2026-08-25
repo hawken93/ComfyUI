@@ -34,7 +34,7 @@ class PixelUnshuffle2D(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels, z_channels, block_out_channels, num_res_blocks,
+    def __init__(self, device, in_channels, z_channels, block_out_channels, num_res_blocks,
                  ffactor_spatial, downsample_match_channel=True, **_):
         super().__init__()
         self.z_channels = z_channels
@@ -62,7 +62,7 @@ class Encoder(nn.Module):
 
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=ch, out_channels=ch, temb_channels=0, conv_op=ops.Conv2d)
-        self.mid.attn_1 = AttnBlock(ch, conv_op=ops.Conv2d)
+        self.mid.attn_1 = AttnBlock(device, ch, conv_op=ops.Conv2d)
         self.mid.block_2 = ResnetBlock(in_channels=ch, out_channels=ch, temb_channels=0, conv_op=ops.Conv2d)
 
         self.norm_out = ops.GroupNorm(32, ch, 1e-6, True)
@@ -87,7 +87,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, z_channels, out_channels, block_out_channels, num_res_blocks,
+    def __init__(self, device, z_channels, out_channels, block_out_channels, num_res_blocks,
                  ffactor_spatial, upsample_match_channel=True, **_):
         super().__init__()
         block_out_channels = block_out_channels[::-1]
@@ -100,7 +100,7 @@ class Decoder(nn.Module):
 
         self.mid = nn.Module()
         self.mid.block_1 = ResnetBlock(in_channels=ch, out_channels=ch, temb_channels=0, conv_op=ops.Conv2d)
-        self.mid.attn_1 = AttnBlock(ch, conv_op=ops.Conv2d)
+        self.mid.attn_1 = AttnBlock(device, ch, conv_op=ops.Conv2d)
         self.mid.block_2 = ResnetBlock(in_channels=ch, out_channels=ch, temb_channels=0, conv_op=ops.Conv2d)
 
         self.up = nn.ModuleList()

@@ -361,12 +361,14 @@ class ElasticGaussianFixedlenDecoder(nn.Module):
 class OctreeGaussianDecoder(nn.Module):
     _MAX_VOXEL_LEVEL = 8
 
-    def __init__(self, device, operations=None, dtype=None):
+    def __init__(self, device, output_device, operations=None, dtype=None):
         super().__init__()
         if operations is None:
             operations = comfy.ops.disable_weight_init
         self.octree = OctreeProbabilityFixedlenDecoder(device, operations, dtype=dtype)
         self.gs = ElasticGaussianFixedlenDecoder(device, operations, dtype=dtype)
+        self.device = device
+        self.output_device = output_device
 
     @property
     def gaussians_per_point(self) -> int:
@@ -381,4 +383,4 @@ class OctreeGaussianDecoder(nn.Module):
             self.octree, latent, num_points=num_decoder_tokens, level=level, temperature=1.0, generator=generator,
         )
         pred = self.gs(x=points_pred, cond=latent)
-        return build_gaussian_models(self.gs, points_pred, pred)  # one GaussianModel per batch item
+        return build_gaussian_models(self.device, self.output_device, self.gs, points_pred, pred)  # one GaussianModel per batch item

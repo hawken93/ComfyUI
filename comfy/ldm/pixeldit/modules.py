@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from comfy.ldm.flux.math import apply_rope, rope
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.modules.diffusionmodules.mmdit import Mlp, get_1d_sincos_pos_embed_from_grid_torch
 
 
@@ -56,9 +56,10 @@ def get_2d_sincos_pos_embed(embed_dim, height, width, device=None, dtype=torch.f
 
 class RotaryAttention(nn.Module):
     """Single-stream self-attention with rotary positional encoding (used inside PiTBlock)."""
-    def __init__(self, dim, num_heads=8, qkv_bias=False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, dim, num_heads=8, qkv_bias=False, dtype=None):
         super().__init__()
         assert dim % num_heads == 0
+        self.optimized_attention = optimized_attention_for_device(device)
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = operations.Linear(dim, dim * 3, bias=qkv_bias, dtype=dtype, device=device)
@@ -73,12 +74,12 @@ class RotaryAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = apply_rope(self.q_norm(q), self.k_norm(k), pos[None, None])
-        x = optimized_attention(q, k, v, H, mask=mask, skip_reshape=True, transformer_options=transformer_options)
+        x = self.optimized_attention(q, k, v, H, mask=mask, skip_reshape=True, transformer_options=transformer_options)
         return self.proj(x)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, out_channels, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, out_channels, dtype=None):
         super().__init__()
         self.norm = operations.RMSNorm(hidden_size, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, out_channels, bias=True, dtype=dtype, device=device)
@@ -89,7 +90,7 @@ class FinalLayer(nn.Module):
 
 class PatchTokenEmbedder(nn.Module):
     """Linear projection used both for patchified-image tokens and text-feature tokens."""
-    def __init__(self, in_chans, embed_dim, use_norm=False, bias=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_chans, embed_dim, use_norm=False, bias=True, dtype=None):
         super().__init__()
         self.proj = operations.Linear(in_chans, embed_dim, bias=bias, dtype=dtype, device=device)
         self.norm = operations.RMSNorm(embed_dim, eps=1e-6, dtype=dtype, device=device) if use_norm else nn.Identity()
@@ -100,7 +101,7 @@ class PatchTokenEmbedder(nn.Module):
 
 class PixelTokenEmbedder(nn.Module):
     """Pixel-level embedder: lifts each RGB pixel to hidden_size and packs into per-patch sequences."""
-    def __init__(self, in_channels, hidden_size_output, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels, hidden_size_output, dtype=None):
         super().__init__()
         self.in_channels = in_channels
         self.hidden_size_output = hidden_size_output
@@ -125,8 +126,8 @@ class PiTBlock(nn.Module):
     runs global self-attention across patches with 2D RoPE, then expands back to P^2 tokens.
     Conditioning is per-pixel adaLN from the patch-level features.
     """
-    def __init__(self, pixel_hidden_size, patch_hidden_size, patch_size, num_heads, mlp_ratio=4.0,
-                 attn_hidden_size=None, attn_num_heads=None, dtype=None, device=None, operations=None, mlp_chunks=1):
+    def __init__(self, device, operations, pixel_hidden_size, patch_hidden_size, patch_size, num_heads, mlp_ratio=4.0,
+                 attn_hidden_size=None, attn_num_heads=None, dtype=None, mlp_chunks=1):
         super().__init__()
         self.pixel_dim = pixel_hidden_size
         self.context_dim = patch_hidden_size
@@ -139,9 +140,9 @@ class PiTBlock(nn.Module):
         self.expand_from_attn = operations.Linear(self.attn_dim, p2 * self.pixel_dim, bias=True, dtype=dtype, device=device)
 
         self.norm1 = operations.RMSNorm(self.pixel_dim, eps=1e-6, dtype=dtype, device=device)
-        self.attn = RotaryAttention(self.attn_dim, num_heads=self.num_heads, qkv_bias=False, dtype=dtype, device=device, operations=operations)
+        self.attn = RotaryAttention(device, operations, self.attn_dim, num_heads=self.num_heads, qkv_bias=False, dtype=dtype)
         self.norm2 = operations.RMSNorm(self.pixel_dim, eps=1e-6, dtype=dtype, device=device)
-        self.mlp = Mlp(self.pixel_dim, hidden_features=int(self.pixel_dim * mlp_ratio), dtype=dtype, device=device, operations=operations)
+        self.mlp = Mlp(device, operations, self.pixel_dim, int(self.pixel_dim * mlp_ratio), dtype=dtype)
 
         self.adaLN_modulation_msa = operations.Linear(self.context_dim, 3 * self.pixel_dim * p2, bias=True, dtype=dtype, device=device)
         self.adaLN_modulation_mlp = operations.Linear(self.context_dim, 3 * self.pixel_dim * p2, bias=True, dtype=dtype, device=device)

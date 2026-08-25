@@ -211,6 +211,7 @@ class VideoDecoder(Decoder):
 
     def __init__(
         self,
+        device,
         *args,
         video_kernel_size: Union[int, list] = 3,
         alpha: float = 0.0,
@@ -233,7 +234,7 @@ class VideoDecoder(Decoder):
         if self.time_mode not in ["attn-only", "only-last-conv"]:
             kwargs["resnet_op"] = partialclass(VideoResBlock, video_kernel_size=self.video_kernel_size, alpha=self.alpha, merge_strategy=self.merge_strategy)
 
-        super().__init__(*args, **kwargs)
+        super().__init__(device, *args, **kwargs)
 
     def get_last_layer(self, skip_time_mix=False, **kwargs):
         if self.time_mode == "attn-only":

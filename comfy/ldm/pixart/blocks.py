@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from comfy.ldm.modules.diffusionmodules.mmdit import TimestepEmbedder, Mlp, timestep_embedding
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 # if model_management.xformers_enabled():
 #     import xformers.ops
@@ -23,10 +23,11 @@ def t2i_modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0., dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, device, operations, d_model, num_heads, attn_drop=0., proj_drop=0., dtype=None):
         super(MultiHeadCrossAttention, self).__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
+        self.optimized_attention = optimized_attention_for_device(device)
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
@@ -69,9 +70,9 @@ class MultiHeadCrossAttention(nn.Module):
         #         # create a mask on the diagonal for each mask in the batch
         #         for _ in range(B - 1):
         #             attn_mask = torch.block_diag(attn_mask, attn_mask_template)
-        #     x = optimized_attention(q, k, v, self.num_heads, mask=attn_mask, skip_reshape=True)
+        #     x = self.optimized_attention(q, k, v, self.num_heads, mask=attn_mask, skip_reshape=True)
 
-        x = optimized_attention(q.view(B, -1, C), k.view(B, -1, C), v.view(B, -1, C), self.num_heads, mask=None)
+        x = self.optimized_attention(q.view(B, -1, C), k.view(B, -1, C), v.view(B, -1, C), self.num_heads, mask=None)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -79,7 +80,7 @@ class MultiHeadCrossAttention(nn.Module):
 
 class AttentionKVCompress(nn.Module):
     """Multi-head Attention block with KV token compression and qk norm."""
-    def __init__(self, dim, num_heads=8, qkv_bias=True, sampling='conv', sr_ratio=1, qk_norm=False, dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, device, operations, dim, num_heads=8, qkv_bias=True, sampling='conv', sr_ratio=1, qk_norm=False, dtype=None):
         """
         Args:
             dim (int): Number of input channels.
@@ -88,6 +89,7 @@ class AttentionKVCompress(nn.Module):
         """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.optimized_attention = optimized_attention_for_device(device)
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
@@ -169,7 +171,7 @@ class AttentionKVCompress(nn.Module):
 
         # attention 2
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v),)
-        x = optimized_attention(q, k, v, self.num_heads, mask=None, skip_reshape=True)
+        x = self.optimized_attention(q, k, v, self.num_heads, mask=None, skip_reshape=True)
 
         x = x.view(B, N, C)
         x = self.proj(x)
@@ -180,7 +182,8 @@ class FinalLayer(nn.Module):
     """
     The final layer of PixArt.
     """
-    def __init__(self, hidden_size, patch_size, out_channels, dtype=None, device=None, operations=None):
+    # TODO dead code
+    def __init__(self, device, operations, hidden_size, patch_size, out_channels, dtype=None):
         super().__init__()
         self.norm_final = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
@@ -199,7 +202,7 @@ class T2IFinalLayer(nn.Module):
     """
     The final layer of PixArt.
     """
-    def __init__(self, hidden_size, patch_size, out_channels, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, hidden_size, patch_size, out_channels, dtype=None):
         super().__init__()
         self.norm_final = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
@@ -217,7 +220,8 @@ class MaskFinalLayer(nn.Module):
     """
     The final layer of PixArt.
     """
-    def __init__(self, final_hidden_size, c_emb_size, patch_size, out_channels, dtype=None, device=None, operations=None):
+    # TODO dead code
+    def __init__(self, device, operations, final_hidden_size, c_emb_size, patch_size, out_channels, dtype=None):
         super().__init__()
         self.norm_final = operations.LayerNorm(final_hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(final_hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
@@ -236,7 +240,8 @@ class DecoderLayer(nn.Module):
     """
     The final layer of PixArt.
     """
-    def __init__(self, hidden_size, decoder_hidden_size, dtype=None, device=None, operations=None):
+    # TODO dead code
+    def __init__(self, device, operations, hidden_size, decoder_hidden_size, dtype=None):
         super().__init__()
         self.norm_decoder = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, decoder_hidden_size, bias=True, dtype=dtype, device=device)
@@ -255,8 +260,8 @@ class SizeEmbedder(TimestepEmbedder):
     """
     Embeds scalar timesteps into vector representations.
     """
-    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=None):
-        super().__init__(hidden_size=hidden_size, frequency_embedding_size=frequency_embedding_size, operations=operations)
+    def __init__(self, device, operations, hidden_size, frequency_embedding_size=256, dtype=None):
+        super().__init__(device, operations, hidden_size, frequency_embedding_size, dtype=dtype)
         self.mlp = nn.Sequential(
             operations.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype, device=device),
             nn.SiLU(),
@@ -284,7 +289,8 @@ class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob, dtype=None, device=None, operations=None):
+    # TODO dead code
+    def __init__(self, device, operations, num_classes, hidden_size, dropout_prob, dtype=None):
         super().__init__()
         use_cfg_embedding = dropout_prob > 0
         self.embedding_table = operations.Embedding(num_classes + use_cfg_embedding, hidden_size, dtype=dtype, device=device),
@@ -314,11 +320,11 @@ class CaptionEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120, dtype=None):
         super().__init__()
         self.y_proj = Mlp(
-            in_features=in_channels, hidden_features=hidden_size, out_features=hidden_size, act_layer=act_layer,
-            dtype=dtype, device=device, operations=operations,
+            device, operations, in_channels, hidden_size, hidden_size, act_layer=act_layer,
+            dtype=dtype,
         )
         self.register_buffer("y_embedding", nn.Parameter(torch.randn(token_num, in_channels) / in_channels ** 0.5))
         self.uncond_prob = uncond_prob
@@ -348,11 +354,12 @@ class CaptionEmbedderDoubleBr(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120, dtype=None, device=None, operations=None):
+    # TODO dead code
+    def __init__(self, device, operations, in_channels, hidden_size, uncond_prob, act_layer=nn.GELU(approximate='tanh'), token_num=120, dtype=None):
         super().__init__()
         self.proj = Mlp(
-            in_features=in_channels, hidden_features=hidden_size, out_features=hidden_size, act_layer=act_layer,
-            dtype=dtype, device=device, operations=operations,
+            device, operations, in_channels, hidden_size, hidden_size, act_layer=act_layer,
+            dtype=dtype,
         )
         self.embedding = nn.Parameter(torch.randn(1, in_channels) / 10 ** 0.5)
         self.y_embedding = nn.Parameter(torch.randn(token_num, in_channels) / 10 ** 0.5)

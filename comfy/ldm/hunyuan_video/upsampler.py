@@ -102,9 +102,8 @@ UPSAMPLERS = {
 }
 
 class HunyuanVideo15SRModel():
-    def __init__(self, model_type, config):
-        self.load_device = comfy.model_management.vae_device()
-        offload_device = comfy.model_management.vae_offload_device()
+    def __init__(self, load_device, offload_device, model_type, config):
+        self.load_device = load_device
         self.dtype = comfy.model_management.vae_dtype(self.load_device)
         self.model_class = UPSAMPLERS.get(model_type)
         self.model = self.model_class(**config).eval()

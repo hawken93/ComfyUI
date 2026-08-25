@@ -19,7 +19,7 @@ class SigmaAwareGate(nn.Module):
     Trained init gives ~0.88 gate at sigma=0, ~0.05 at sigma=1.
     """
 
-    def __init__(self, dim: int, per_token: bool = False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, dim: int, per_token: bool = False, dtype=None):
         super().__init__()
         self.content_proj = operations.Linear(dim * 2, 1 if per_token else dim, dtype=dtype, device=device)
         self.log_alpha = nn.Parameter(torch.empty((), dtype=dtype, device=device))
@@ -36,7 +36,7 @@ class SigmaAwareGate(nn.Module):
 class ResBlock(nn.Module):
     """Pre-activation ResNet block: GN -> SiLU -> Conv -> GN -> SiLU -> Conv + skip."""
 
-    def __init__(self, channels: int, num_groups: int = 4, conv_padding_mode: str = "zeros", dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, channels: int, num_groups: int = 4, conv_padding_mode: str = "zeros", dtype=None):
         super().__init__()
         self.block = nn.Sequential(
             operations.GroupNorm(num_groups, channels, dtype=dtype, device=device),
@@ -56,6 +56,8 @@ class LQProjection2D(nn.Module):
 
     def __init__(
         self,
+        device,
+        operations,
         latent_channels: int,
         hidden_dim: int = 512,
         out_dim: int = 1536,
@@ -69,7 +71,7 @@ class LQProjection2D(nn.Module):
         conv_padding_mode: str = "zeros",
         gate_per_token: bool = False,
         pit_output: bool = False,
-        dtype=None, device=None, operations=None,
+        dtype=None,
     ):
         super().__init__()
         self.latent_channels = latent_channels
@@ -101,7 +103,7 @@ class LQProjection2D(nn.Module):
             operations.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, padding_mode=conv_padding_mode, dtype=dtype, device=device),
         ]
         for _ in range(num_res_blocks):
-            layers.append(ResBlock(hidden_dim, conv_padding_mode=conv_padding_mode, dtype=dtype, device=device, operations=operations))
+            layers.append(ResBlock(device, operations, hidden_dim, conv_padding_mode=conv_padding_mode, dtype=dtype))
         self.latent_proj = nn.Sequential(*layers)
 
         self.output_heads = nn.ModuleList(
@@ -109,7 +111,7 @@ class LQProjection2D(nn.Module):
         )
         self.pit_head = operations.Linear(hidden_dim, out_dim, dtype=dtype, device=device) if pit_output else None
         self.gate_modules = nn.ModuleList(
-            [SigmaAwareGate(out_dim, per_token=gate_per_token, dtype=dtype, device=device, operations=operations)
+            [SigmaAwareGate(device, operations, out_dim, per_token=gate_per_token, dtype=dtype)
              for _ in range(num_outputs)]
         )
 
@@ -159,6 +161,7 @@ class PidNet(PixDiT_T2I):
     def __init__(
         self,
         device,
+        operations,
         lq_latent_channels: int = 16,
         lq_hidden_dim: int = 512,
         lq_num_res_blocks: int = 4,
@@ -172,10 +175,10 @@ class PidNet(PixDiT_T2I):
         rope_ref_h: int = 1024, # NTK ref resolution in PIXEL units: 1024px / patch=16 -> grid_ref=64.
         rope_ref_w: int = 1024,
         image_model=None,
-        dtype=None, operations=None,
+        dtype=None,
         **pixdit_kwargs,
     ):
-        super().__init__(device, dtype=dtype, operations=operations, **pixdit_kwargs)
+        super().__init__(device, operations, dtype=dtype, **pixdit_kwargs)
 
         self.rope_ref_grid_h = rope_ref_h // self.patch_size
         self.rope_ref_grid_w = rope_ref_w // self.patch_size
@@ -190,6 +193,7 @@ class PidNet(PixDiT_T2I):
 
         num_lq_outputs = (self.patch_depth + lq_interval - 1) // lq_interval
         self.lq_proj = LQProjection2D(
+            device, operations,
             latent_channels=lq_latent_channels,
             hidden_dim=lq_hidden_dim,
             out_dim=self.hidden_size,
@@ -204,11 +208,9 @@ class PidNet(PixDiT_T2I):
             gate_per_token=lq_gate_per_token,
             pit_output=pit_lq_inject,
             dtype=dtype,
-            device=device,
-            operations=operations,
         )
         self.pit_lq_gate = SigmaAwareGate(
-            self.hidden_size, per_token=lq_gate_per_token, dtype=dtype, device=device, operations=operations
+            device, operations, self.hidden_size, per_token=lq_gate_per_token, dtype=dtype
         ) if pit_lq_inject else None
 
     def _fetch_patch_pos(self, height, width, device, dtype, **rope_opts):

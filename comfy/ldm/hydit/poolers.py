@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.ops
 
 class AttentionPool(nn.Module):
-    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None, dtype=None):
         super().__init__()
+        self.optimized_attention = optimized_attention_for_device(device)
         self.positional_embedding = nn.Parameter(torch.empty(spacial_dim + 1, embed_dim, dtype=dtype, device=device))
         self.k_proj = operations.Linear(embed_dim, embed_dim, dtype=dtype, device=device)
         self.q_proj = operations.Linear(embed_dim, embed_dim, dtype=dtype, device=device)
@@ -30,7 +31,7 @@ class AttentionPool(nn.Module):
         k = k.view(k.shape[0], batch_size * self.num_heads, head_dim).transpose(0, 1).view(batch_size, self.num_heads, -1, head_dim)
         v = v.view(v.shape[0], batch_size * self.num_heads, head_dim).transpose(0, 1).view(batch_size, self.num_heads, -1, head_dim)
 
-        attn_output = optimized_attention(q, k, v, self.num_heads, skip_reshape=True).transpose(0, 1)
+        attn_output = self.optimized_attention(q, k, v, self.num_heads, skip_reshape=True).transpose(0, 1)
 
         attn_output = self.c_proj(attn_output)
         return attn_output.squeeze(0)

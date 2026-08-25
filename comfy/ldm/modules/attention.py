@@ -861,7 +861,7 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
         )
     return out
 
-def optimized_attention_for_device(device, small_input=False):
+def optimized_attention_for_device(device, small_input=False, need_mask=False):
     if small_input:
         if model_management.pytorch_attention_enabled(device):
             return attention_pytorch #TODO: need to confirm but this is probably slightly faster for small inputs in all cases
@@ -883,7 +883,8 @@ def optimized_attention_for_device(device, small_input=False):
             exit(-1)
     elif SAGE_ATTENTION_IS_AVAILABLE and model_management.sage_attention_enabled():
         return attention_sage
-    elif FLASH_ATTENTION_IS_AVAILABLE and model_management.flash_attention_enabled():
+    elif FLASH_ATTENTION_IS_AVAILABLE and model_management.flash_attention_enabled() and not need_mask:
+        # flash attention kernels only support structured mask patterns (causal, varlen), not arbitrary data masks
         return attention_flash
     elif model_management.xformers_enabled(device):
         return attention_xformers

@@ -32,35 +32,35 @@ class ControlNetEmbedder(nn.Module):
         self.hidden_size = num_attention_heads * attention_head_dim
         self.patch_size = patch_size
         self.x_embedder = PatchEmbed(
+            device,
+            operations,
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=self.hidden_size,
             strict_img_size=pos_embed_max_size is None,
-            device=device,
             dtype=dtype,
-            operations=operations,
         )
 
-        self.t_embedder = TimestepEmbedder(self.hidden_size, dtype=dtype, device=device, operations=operations)
+        self.t_embedder = TimestepEmbedder(device, operations, self.hidden_size, dtype=dtype)
 
         self.double_y_emb = double_y_emb
         if self.double_y_emb:
             self.orig_y_embedder = VectorEmbedder(
-                adm_in_channels, self.hidden_size, dtype, device, operations=operations
+                device, operations, adm_in_channels, self.hidden_size, dtype=dtype
             )
             self.y_embedder = VectorEmbedder(
-                self.hidden_size, self.hidden_size, dtype, device, operations=operations
+                device, operations, self.hidden_size, self.hidden_size, dtype=dtype
             )
         else:
             self.y_embedder = VectorEmbedder(
-                adm_in_channels, self.hidden_size, dtype, device, operations=operations
+                device, operations, adm_in_channels, self.hidden_size, dtype=dtype
             )
 
         self.transformer_blocks = nn.ModuleList(
             DismantledBlock(
-                hidden_size=self.hidden_size, num_heads=num_attention_heads, qkv_bias=True,
-                dtype=dtype, device=device, operations=operations
+                device, operations, self.hidden_size, num_attention_heads, qkv_bias=True,
+                dtype=dtype
             )
             for _ in range(num_layers)
         )
@@ -75,14 +75,14 @@ class ControlNetEmbedder(nn.Module):
             self.controlnet_blocks.append(controlnet_block)
 
         self.pos_embed_input = PatchEmbed(
+            device,
+            operations,
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=self.hidden_size,
             strict_img_size=False,
-            device=device,
             dtype=dtype,
-            operations=operations,
         )
 
     def forward(

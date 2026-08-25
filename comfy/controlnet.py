@@ -633,7 +633,7 @@ def load_controlnet_sd35(sd, device, model_options={}):
 def load_controlnet_hunyuandit(controlnet_data, load_device, model_options={}):
     model_config, operations, _, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(controlnet_data, load_device, model_options=model_options)
 
-    control_model = comfy.ldm.hydit.controlnet.HunYuanControlNet(operations=operations, device=offload_device, dtype=unet_dtype)
+    control_model = comfy.ldm.hydit.controlnet.HunYuanControlNet(offload_device, operations, dtype=unet_dtype)
     control_model = controlnet_load_state_dict(control_model, controlnet_data)
 
     latent_format = comfy.latent_formats.SDXL()

@@ -345,6 +345,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         operations=ops,
     ):
         super().__init__()
+        self.output_device = comfy.model_management.intermediate_device(device)
         self.vae_ratio = int(math.prod(space_down))
         self.vae_ratio_t = int(math.prod(time_down))
 
@@ -616,7 +617,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         if output_buffer is None:
             # finalized chunks stream out of VRAM so the full video never sits on the GPU
             output_buffer = torch.empty(self.decode_output_shape(z.shape), dtype=torch.float32,
-                                        device=comfy.model_management.intermediate_device())
+                                        device=self.output_device)
 
         pad_tokens, num_chunks = self._decode_temporal_chunks(z.shape[2])
         if pad_tokens > 0:

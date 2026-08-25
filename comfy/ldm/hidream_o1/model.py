@@ -115,7 +115,7 @@ class HiDreamO1Transformer(nn.Module):
         self.visual = Qwen35VisionModel(vision_cfg, device=device, dtype=dtype, ops=operations)
         self.language_model = Llama2_(text_cfg, device=device, dtype=dtype, ops=operations)
         self.t_embedder1 = TimestepEmbedder(
-            text_cfg.hidden_size, device=device, dtype=dtype, operations=operations,
+            device, operations, text_cfg.hidden_size, dtype=dtype,
         )
         self.x_embedder = BottleneckPatchEmbed(
             patch_size=self.patch_size, in_chans=self.in_channels,

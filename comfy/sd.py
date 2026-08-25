@@ -493,6 +493,10 @@ class VAE:
         else:
             VAE_KL_MEM_RATIO = 1.0
 
+        device = model_management.vae_device(device)
+        self.device = device
+        self.output_device = model_management.intermediate_device(device)
+
         self.memory_used_encode = lambda shape, dtype: (1767 * shape[2] * shape[3]) * model_management.dtype_size(dtype) * VAE_KL_MEM_RATIO #These are for AutoencoderKL and need tweaking (should be lower)
         self.memory_used_decode = lambda shape, dtype: (2178 * shape[2] * shape[3] * 64) * model_management.dtype_size(dtype) * VAE_KL_MEM_RATIO
         self.downscale_ratio = 8
@@ -538,7 +542,7 @@ class VAE:
                 decoder_config = encoder_config.copy()
                 decoder_config["video_kernel_size"] = [3, 1, 1]
                 decoder_config["alpha"] = 0.0
-                self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                self.first_stage_model = AutoencodingEngine(device, regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                             encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': encoder_config},
                                                             decoder_config={'target': "comfy.ldm.modules.temporal_ae.VideoDecoder", 'params': decoder_config})
             elif "taesd_decoder.1.weight" in sd:
@@ -625,7 +629,7 @@ class VAE:
                     self.downscale_ratio = 32
                     self.upscale_ratio = 32
                     self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
-                    self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                    self.first_stage_model = AutoencodingEngine(device, regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                                 encoder_config={'target': "comfy.ldm.hunyuan_video.vae.Encoder", 'params': ddconfig},
                                                                 decoder_config={'target': "comfy.ldm.hunyuan_video.vae.Decoder", 'params': ddconfig})
 
@@ -641,7 +645,7 @@ class VAE:
                     self.downscale_index_formula = (4, 16, 16)
                     self.latent_dim = 3
                     self.not_video = True
-                    self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                    self.first_stage_model = AutoencodingEngine(device, regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                                 encoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Encoder", 'params': ddconfig},
                                                                 decoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Decoder", 'params': ddconfig})
 
@@ -676,9 +680,9 @@ class VAE:
                         decoder_ddconfig = None
 
                     if 'post_quant_conv.weight' in sd:
-                        self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1], **({"decoder_ddconfig": decoder_ddconfig} if decoder_ddconfig is not None else {}))
+                        self.first_stage_model = AutoencoderKL(device, ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1], **({"decoder_ddconfig": decoder_ddconfig} if decoder_ddconfig is not None else {}))
                     else:
-                        self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                        self.first_stage_model = AutoencodingEngine(device, regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                                     encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': ddconfig},
                                                                     decoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Decoder", 'params': decoder_ddconfig if decoder_ddconfig is not None else ddconfig})
             elif "decoder.layers.1.layers.0.beta" in sd:
@@ -756,7 +760,7 @@ class VAE:
                 self.latent_dim = 3
                 self.not_video = False
                 self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
-                self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.EmptyRegularizer"},
+                self.first_stage_model = AutoencodingEngine(device, regularizer_config={'target': "comfy.ldm.models.autoencoder.EmptyRegularizer"},
                                                             encoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Encoder", 'params': ddconfig},
                                                             decoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Decoder", 'params': ddconfig})
 
@@ -783,7 +787,7 @@ class VAE:
                 self.downscale_index_formula = (4, 8, 8)
                 self.latent_dim = 3
                 self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.conv.weight"].shape[1]
-                self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
+                self.first_stage_model = AutoencoderKL(device, ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
                 #This is likely to significantly over-estimate with single image or low frame counts as the
                 #implementation is able to completely skip caching. Rework if used as an image only VAE
                 self.memory_used_decode = lambda shape, dtype: (2800 * min(8, ((shape[2] - 1) * 4) + 1) * shape[3] * shape[4] * (8 * 8)) * model_management.dtype_size(dtype)
@@ -1038,7 +1042,7 @@ class VAE:
                 self.memory_used_encode = lambda shape, dtype: estimate_encode_memory(shape[2], dtype)
                 self.memory_used_decode = lambda shape, dtype: estimate_decode_memory(shape[-1] * self.upscale_ratio, dtype)
             elif "gs.base_offset_scale" in sd and "octree.out_proj.weight" in sd:  # TripoSplat octree gaussian decoder
-                self.first_stage_model = comfy.ldm.triposplat.vae.OctreeGaussianDecoder(device)
+                self.first_stage_model = comfy.ldm.triposplat.vae.OctreeGaussianDecoder(self.device, self.output_device)
                 self.latent_channels = 16
                 self.latent_dim = 1
                 self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
@@ -1052,17 +1056,15 @@ class VAE:
                 self.first_stage_model = None
                 return
         else:
-            self.first_stage_model = AutoencoderKL(**(config['params']))
+            self.first_stage_model = AutoencoderKL(device, **config['params'])
         self.first_stage_model = self.first_stage_model.eval()
 
-        self.device = model_management.vae_device(device)
         offload_device = model_management.vae_offload_device(device)
         if dtype is None:
             dtype = model_management.vae_dtype(self.device, self.working_dtypes)
         self.vae_dtype = dtype
         self.first_stage_model.to(self.vae_dtype)
         model_management.archive_model_dtypes(self.first_stage_model)
-        self.output_device = model_management.intermediate_device()
 
         mp = comfy.model_patcher.CoreModelPatcher
         if self.disable_offload:

@@ -86,10 +86,7 @@ class Ideogram4TransformerBlock(nn.Module):
     def __init__(self, hidden_size, intermediate_size, num_heads, norm_eps, adaln_dim, dtype=None, device=None, operations=None):
         super().__init__()
         self.attention = Ideogram4Attention(hidden_size, num_heads, eps=1e-5, dtype=dtype, device=device, operations=operations)
-        self.feed_forward = FeedForward(
-            dim=hidden_size, hidden_dim=intermediate_size, multiple_of=1, ffn_dim_multiplier=None,
-            operation_settings={"operations": operations, "dtype": dtype, "device": device},
-        )
+        self.feed_forward = FeedForward(device, operations, hidden_size, intermediate_size, 1, None, dtype=dtype)
 
         self.attention_norm1 = operations.RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=True, dtype=dtype, device=device)
         self.ffn_norm1 = operations.RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=True, dtype=dtype, device=device)
