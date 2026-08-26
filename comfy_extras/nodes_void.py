@@ -69,6 +69,14 @@ class OpticalFlowLoader(io.ComfyNode):
                         "raft_large.pth is supported."
                     ),
                 ),
+                io.Combo.Input(
+                    "device",
+                    options=comfy.model_management.get_gpu_device_options(),
+                    optional=True,
+                    advanced=True,
+                    default="default",
+                    tooltip="Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs.",
+                ),
             ],
             outputs=[
                 OpticalFlow.Output(),
@@ -76,7 +84,7 @@ class OpticalFlowLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_name) -> io.NodeOutput:
+    def execute(cls, model_name, device="default") -> io.NodeOutput:
 
         model_path = folder_paths.get_full_path_or_raise("optical_flow", model_name)
         sd = comfy.utils.load_torch_file(model_path, safe_load=True)
@@ -97,10 +105,14 @@ class OpticalFlowLoader(io.ComfyNode):
         model.load_state_dict(sd)
         model.eval().to(torch.float32)
 
+        device = comfy.model_management.pick_device_for_option(
+            device,
+            memory_required=comfy.utils.calculate_parameters(sd) * comfy.model_management.dtype_size(torch.float32),
+            dtype=torch.float32)
         patcher = comfy.model_patcher.ModelPatcher(
             model,
-            load_device=comfy.model_management.get_torch_device(),
-            offload_device=comfy.model_management.unet_offload_device(),
+            load_device=device,
+            offload_device=comfy.model_management.unet_offload_device(device),
         )
         return io.NodeOutput(patcher)
 
@@ -327,10 +339,10 @@ class VOIDWarpedNoise(io.ComfyNode):
         # we want the actual torch device (CUDA/MPS).  The final latent is
         # moved back to intermediate_device() before returning to match the
         # rest of the ComfyUI pipeline.
-        device = comfy.model_management.get_torch_device()
+        device = optical_flow.load_device
 
         comfy.model_management.load_model_gpu(optical_flow)
-        raft = RaftOpticalFlow(optical_flow.model, device=device)
+        raft = RaftOpticalFlow(device, optical_flow.model)
 
         vid = video[:length].to(device)
         vid = comfy.utils.common_upscale(
@@ -343,13 +355,13 @@ class VOIDWarpedNoise(io.ComfyNode):
         LATENT_SCALE = 8
 
         warped = get_noise_from_video(
+            device,
             vid_uint8,
             raft,
             noise_channels=16,
             resize_frames=FRAME,
             resize_flow=FLOW,
             downscale_factor=round(FRAME * FLOW) * LATENT_SCALE,
-            device=device,
         )
 
         if warped.shape[0] != latent_t:
@@ -371,7 +383,8 @@ class VOIDWarpedNoise(io.ComfyNode):
         if batch_size > 1:
             warped_tensor = warped_tensor.repeat(batch_size, 1, 1, 1, 1)
 
-        warped_tensor = warped_tensor.to(comfy.model_management.intermediate_device())
+        intermediate_device = comfy.model_management.intermediate_device(device)
+        warped_tensor = warped_tensor.to(intermediate_device)
         return io.NodeOutput({"samples": warped_tensor})
 
 

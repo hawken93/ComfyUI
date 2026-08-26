@@ -10,16 +10,17 @@ import node_helpers
 class ImageOnlyCheckpointLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
-                             }}
+        return {"required": { "ckpt_name": (folder_paths.get_filename_list("checkpoints"), )},
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}}
     RETURN_TYPES = ("MODEL", "CLIP_VISION", "VAE")
     FUNCTION = "load_checkpoint"
 
     CATEGORY = "model/loaders"
 
-    def load_checkpoint(self, ckpt_name, output_vae=True, output_clip=True):
+    def load_checkpoint(self, ckpt_name, output_vae=True, output_clip=True, device="default"):
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=False, output_clipvision=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+        load_device = comfy.model_management.pick_device_for_option(device)
+        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, load_device, comfy.model_management.unet_offload_device(load_device), output_vae=True, output_clip=False, output_clipvision=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         return (out[0], out[3], out[2])
 
 

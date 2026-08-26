@@ -146,22 +146,35 @@ class LoadDA3Model(io.ComfyNode):
                     options=["default", "fp16", "bf16", "fp32"],
                     default="default",
                 ),
+                io.Combo.Input(
+                    "device",
+                    options=comfy.model_management.get_gpu_device_options(),
+                    optional=True,
+                    advanced=True,
+                    default="default",
+                    tooltip="Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs.",
+                ),
             ],
             outputs=[DA3ModelType.Output()],
         )
 
     @classmethod
-    def execute(cls, model_name, weight_dtype) -> io.NodeOutput:
+    def execute(cls, model_name, weight_dtype, device="default") -> io.NodeOutput:
         model_options = {}
+        dtype = None
         if weight_dtype == "fp16":
-            model_options["dtype"] = torch.float16
+            dtype = torch.float16
         elif weight_dtype == "bf16":
-            model_options["dtype"] = torch.bfloat16
+            dtype = torch.bfloat16
         elif weight_dtype == "fp32":
-            model_options["dtype"] = torch.float32
+            dtype = torch.float32
+        if dtype is not None:
+            model_options["dtype"] = dtype
 
         path = folder_paths.get_full_path_or_raise("geometry_estimation", model_name)
-        model = comfy.sd.load_diffusion_model(path, model_options=model_options)
+        load_device = comfy.model_management.pick_device_for_option(device, dtype=dtype)
+        offload_device = comfy.model_management.unet_offload_device(load_device)
+        model = comfy.sd.load_diffusion_model(path, load_device, offload_device, model_options=model_options)
         return io.NodeOutput(model)
 
 
@@ -172,7 +185,7 @@ def _run_da3(model_patcher, image: torch.Tensor, process_res: int, method: str =
     B, H, W, _ = image.shape
     mm.load_model_gpu(model_patcher)
     diffusion = model_patcher.model.diffusion_model
-    device = mm.get_torch_device()
+    device = model_patcher.load_device
     dtype = diffusion.dtype if diffusion.dtype is not None else torch.float32
 
     depths, confs, skies = [], [], []
@@ -318,7 +331,7 @@ class DA3Inference(io.ComfyNode):
 
         mm.load_model_gpu(model)
         diffusion = model.model.diffusion_model
-        device = mm.get_torch_device()
+        device = model.load_device
         dtype = diffusion.dtype if diffusion.dtype is not None else torch.float32
 
         # All views in a single forward pass: (1, S, 3, H', W').

@@ -927,6 +927,9 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
 # consumer of the returned placements.
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
+    # Ensure multiple models are resident at their chosen devices.
+    # This is mainly used to fetch models back from offload_devices
+
     cleanup_models_gc()
     global vram_state
 
@@ -1025,6 +1028,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
     return
 
 def load_model_gpu(model):
+    # Ensure model is resident
     return load_models_gpu([model])
 
 def loaded_models(only_currently_used=False):

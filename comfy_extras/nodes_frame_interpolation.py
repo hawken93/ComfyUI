@@ -23,6 +23,8 @@ class FrameInterpolationModelLoader(io.ComfyNode):
             inputs=[
                 io.Combo.Input("model_name", options=folder_paths.get_filename_list("frame_interpolation"),
                                tooltip="Select a frame interpolation model to load. Models must be placed in the 'frame_interpolation' folder."),
+                io.Combo.Input("device", options=model_management.get_gpu_device_options(), optional=True, advanced=True, default="default",
+                               tooltip="Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."),
             ],
             outputs=[
                 FrameInterpolationModel.Output(),
@@ -30,18 +32,18 @@ class FrameInterpolationModelLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_name) -> io.NodeOutput:
+    def execute(cls, model_name, device="default") -> io.NodeOutput:
         model_path = folder_paths.get_full_path_or_raise("frame_interpolation", model_name)
         sd = comfy.utils.load_torch_file(model_path, safe_load=True)
 
         model = cls._detect_and_load(sd)
-        dtype = torch.float16 if model_management.should_use_fp16(model_management.get_torch_device()) else torch.float32
+        # TODO to select dtype strictly with pick_device_for_option, add dtype input
+        #      so that user can pick one or not pick one.
+        device = model_management.pick_device_for_option(device)
+        offload_device = model_management.unet_offload_device(device)
+        dtype = torch.float16 if model_management.should_use_fp16(device) else torch.float32
         model.eval().to(dtype)
-        patcher = comfy.model_patcher.CoreModelPatcher(
-            model,
-            load_device=model_management.get_torch_device(),
-            offload_device=model_management.unet_offload_device(),
-        )
+        patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=device, offload_device=offload_device)
         return io.NodeOutput(patcher)
 
     @classmethod
@@ -92,13 +94,12 @@ class FrameInterpolate(io.ComfyNode):
 
     @classmethod
     def execute(cls, interp_model, images, multiplier) -> io.NodeOutput:
-        offload_device = model_management.intermediate_device()
-
         num_frames = images.shape[0]
         if num_frames < 2 or multiplier < 2:
             return io.NodeOutput(images)
 
         device = interp_model.load_device
+        offload_device = model_management.intermediate_device(device)
         dtype = interp_model.model_dtype()
         inference_model = interp_model.model
         activation_mem = inference_model.memory_used_forward(images.shape, dtype)

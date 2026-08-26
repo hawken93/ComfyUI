@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-import comfy.model_management
 from comfy.ldm.modules.attention import optimized_attention_for_device
 
 COCO_CLASSES = [
@@ -27,7 +26,7 @@ COCO_CLASSES = [
 
 class ConvBNAct(nn.Module):
     """Conv→BN→ReLU.  padding='same' adds asymmetric zero-pad (stem)."""
-    def __init__(self, ic, oc, k=3, s=1, groups=1, use_act=True, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, oc, k=3, s=1, groups=1, use_act=True, dtype=None):
         super().__init__()
 
         self.conv = operations.Conv2d(ic, oc, k, s, (k - 1) // 2, groups=groups, bias=False, device=device, dtype=dtype)
@@ -38,24 +37,24 @@ class ConvBNAct(nn.Module):
         return self.act(self.bn(self.conv(x)))
 
 class LightConvBNAct(nn.Module):
-    def __init__(self, ic, oc, k, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, oc, k, dtype=None):
         super().__init__()
-        self.conv1 = ConvBNAct(ic, oc, 1, use_act=False, device=device, dtype=dtype, operations=operations)
-        self.conv2 = ConvBNAct(oc, oc, k, groups=oc, use_act=True, device=device, dtype=dtype, operations=operations)
+        self.conv1 = ConvBNAct(device, operations, ic, oc, 1, use_act=False, dtype=dtype)
+        self.conv2 = ConvBNAct(device, operations, oc, oc, k, groups=oc, use_act=True, dtype=dtype)
 
     def forward(self, x):
         return self.conv2(self.conv1(x))
 
 class _StemBlock(nn.Module):
-    def __init__(self, ic, mc, oc, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, mc, oc, dtype=None):
         super().__init__()
-        self.stem1  = ConvBNAct(ic,    mc,    3, 2, device=device, dtype=dtype, operations=operations)
+        self.stem1  = ConvBNAct(device, operations, ic,    mc,    3, 2, dtype=dtype)
         # stem2a/stem2b use kernel=2, stride=1, no internal padding;
         # padding is applied manually in forward (matching PaddlePaddle original)
-        self.stem2a = ConvBNAct(mc,    mc//2, 2, 1, device=device, dtype=dtype, operations=operations)
-        self.stem2b = ConvBNAct(mc//2, mc,    2, 1, device=device, dtype=dtype, operations=operations)
-        self.stem3  = ConvBNAct(mc*2,  mc,    3, 2, device=device, dtype=dtype, operations=operations)
-        self.stem4  = ConvBNAct(mc,    oc,    1, device=device, dtype=dtype, operations=operations)
+        self.stem2a = ConvBNAct(device, operations, mc,    mc//2, 2, 1, dtype=dtype)
+        self.stem2b = ConvBNAct(device, operations, mc//2, mc,    2, 1, dtype=dtype)
+        self.stem3  = ConvBNAct(device, operations, mc*2,  mc,    3, 2, dtype=dtype)
+        self.stem4  = ConvBNAct(device, operations, mc,    oc,    1, dtype=dtype)
         self.pool   = nn.MaxPool2d(2, 1, ceil_mode=True)
 
     def forward(self, x):
@@ -69,20 +68,20 @@ class _StemBlock(nn.Module):
 
 
 class _HG_Block(nn.Module):
-    def __init__(self, ic, mc, oc, layer_num, k=3, residual=False, light=False, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, mc, oc, layer_num, k=3, residual=False, light=False, dtype=None):
         super().__init__()
         self.residual = residual
         if light:
             self.layers = nn.ModuleList(
-                [LightConvBNAct(ic if i == 0 else mc, mc, k, device=device, dtype=dtype, operations=operations) for i in range(layer_num)])
+                [LightConvBNAct(device, operations, ic if i == 0 else mc, mc, k, dtype=dtype) for i in range(layer_num)])
         else:
             self.layers = nn.ModuleList(
-                [ConvBNAct(ic if i == 0 else mc, mc, k, device=device, dtype=dtype, operations=operations) for i in range(layer_num)])
+                [ConvBNAct(device, operations, ic if i == 0 else mc, mc, k, dtype=dtype) for i in range(layer_num)])
         total = ic + layer_num * mc
 
         self.aggregation = nn.Sequential(
-            ConvBNAct(total,   oc // 2, 1, device=device, dtype=dtype, operations=operations),
-            ConvBNAct(oc // 2, oc,      1, device=device, dtype=dtype, operations=operations))
+            ConvBNAct(device, operations, total,   oc // 2, 1, dtype=dtype),
+            ConvBNAct(device, operations, oc // 2, oc,      1, dtype=dtype))
 
     def forward(self, x):
         identity = x
@@ -96,15 +95,15 @@ class _HG_Block(nn.Module):
 
 class _HG_Stage(nn.Module):
     # config order: ic, mc, oc, num_blocks, downsample, light, k, layer_num
-    def __init__(self, ic, mc, oc, num_blocks, downsample=True, light=False, k=3, layer_num=6, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, mc, oc, num_blocks, downsample=True, light=False, k=3, layer_num=6, dtype=None):
         super().__init__()
         if downsample:
-            self.downsample = ConvBNAct(ic, ic, 3, 2, groups=ic, use_act=False, device=device, dtype=dtype, operations=operations)
+            self.downsample = ConvBNAct(device, operations, ic, ic, 3, 2, groups=ic, use_act=False, dtype=dtype)
         else:
             self.downsample = nn.Identity()
         self.blocks = nn.Sequential(*[
-            _HG_Block(ic if i == 0 else oc, mc, oc, layer_num,
-                      k=k, residual=(i != 0), light=light, device=device, dtype=dtype, operations=operations)
+            _HG_Block(device, operations, ic if i == 0 else oc, mc, oc, layer_num,
+                      k=k, residual=(i != 0), light=light, dtype=dtype)
             for i in range(num_blocks)
         ])
 
@@ -115,14 +114,14 @@ class _HG_Stage(nn.Module):
 class HGNetv2(nn.Module):
     # B5 config: stem=[3,32,64], stages=[ic, mc, oc, blocks, down, light, k, layers]
     _STAGE_CFGS = [[64,  64,  128,  1, False, False, 3, 6],
-                   [128, 128, 512,  2, True,  False, 3, 6],
+                   [128, 128,  512,  2, True,  False, 3, 6],
                    [512, 256, 1024, 5, True,  True,  5, 6],
                    [1024,512, 2048, 2, True,  True,  5, 6]]
 
-    def __init__(self, return_idx=(1, 2, 3), device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, return_idx=(1, 2, 3), dtype=None):
         super().__init__()
-        self.stem   = _StemBlock(3, 32, 64, device=device, dtype=dtype, operations=operations)
-        self.stages = nn.ModuleList([_HG_Stage(*cfg, device=device, dtype=dtype, operations=operations) for cfg in self._STAGE_CFGS])
+        self.stem   = _StemBlock(device, operations, 3, 32, 64, dtype=dtype)
+        self.stages = nn.ModuleList([_HG_Stage(device, operations, *cfg, dtype=dtype) for cfg in self._STAGE_CFGS])
         self.return_idx  = list(return_idx)
         self.out_channels = [self._STAGE_CFGS[i][2] for i in return_idx]
 
@@ -142,7 +141,7 @@ class HGNetv2(nn.Module):
 
 class ConvNormLayer(nn.Module):
     """Conv→act (expects pre-fused BN weights)."""
-    def __init__(self, ic, oc, k, s, g=1, padding=None, act=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, oc, k, s, g=1, padding=None, act=None, dtype=None):
         super().__init__()
         p = (k - 1) // 2 if padding is None else padding
         self.conv = operations.Conv2d(ic, oc, k, s, p, groups=g, bias=True, device=device, dtype=dtype)
@@ -154,7 +153,7 @@ class ConvNormLayer(nn.Module):
 
 class VGGBlock(nn.Module):
     """Rep-VGG block (expects pre-fused weights)."""
-    def __init__(self, ic, oc, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, oc, dtype=None):
         super().__init__()
         self.conv = operations.Conv2d(ic, oc, 3, 1, padding=1, bias=True, device=device, dtype=dtype)
         self.act  = nn.SiLU()
@@ -164,13 +163,13 @@ class VGGBlock(nn.Module):
 
 
 class CSPLayer(nn.Module):
-    def __init__(self, ic, oc, num_blocks=3, expansion=1.0, act='silu', device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, oc, num_blocks=3, expansion=1.0, act='silu', dtype=None):
         super().__init__()
         h = int(oc * expansion)
-        self.conv1 = ConvNormLayer(ic, h, 1, 1, act=act, device=device, dtype=dtype, operations=operations)
-        self.conv2 = ConvNormLayer(ic, h, 1, 1, act=act, device=device, dtype=dtype, operations=operations)
-        self.bottlenecks = nn.Sequential(*[VGGBlock(h, h, device=device, dtype=dtype, operations=operations) for _ in range(num_blocks)])
-        self.conv3 = ConvNormLayer(h, oc, 1, 1, act=act, device=device, dtype=dtype, operations=operations) if h != oc else nn.Identity()
+        self.conv1 = ConvNormLayer(device, operations, ic, h, 1, 1, act=act, dtype=dtype)
+        self.conv2 = ConvNormLayer(device, operations, ic, h, 1, 1, act=act, dtype=dtype)
+        self.bottlenecks = nn.Sequential(*[VGGBlock(device, operations, h, h, dtype=dtype) for _ in range(num_blocks)])
+        self.conv3 = ConvNormLayer(device, operations, h, oc, 1, 1, act=act, dtype=dtype) if h != oc else nn.Identity()
 
     def forward(self, x):
         return self.conv3(self.bottlenecks(self.conv1(x)) + self.conv2(x))
@@ -178,13 +177,13 @@ class CSPLayer(nn.Module):
 
 class RepNCSPELAN4(nn.Module):
     """CSP-ELAN block — the FPN/PAN block in RTv4's HybridEncoder."""
-    def __init__(self, c1, c2, c3, c4, n=3, act='silu', device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, c1, c2, c3, c4, n=3, act='silu', dtype=None):
         super().__init__()
         self.c = c3 // 2
-        self.cv1 = ConvNormLayer(c1, c3, 1, 1, act=act, device=device, dtype=dtype, operations=operations)
-        self.cv2 = nn.Sequential(CSPLayer(c3 // 2, c4, n, 1.0, act=act, device=device, dtype=dtype, operations=operations), ConvNormLayer(c4, c4, 3, 1, act=act, device=device, dtype=dtype, operations=operations))
-        self.cv3 = nn.Sequential(CSPLayer(c4, c4, n, 1.0, act=act, device=device, dtype=dtype, operations=operations), ConvNormLayer(c4, c4, 3, 1, act=act, device=device, dtype=dtype, operations=operations))
-        self.cv4 = ConvNormLayer(c3 + 2 * c4, c2, 1, 1, act=act, device=device, dtype=dtype, operations=operations)
+        self.cv1 = ConvNormLayer(device, operations, c1, c3, 1, 1, act=act, dtype=dtype)
+        self.cv2 = nn.Sequential(CSPLayer(device, operations, c3 // 2, c4, n, 1.0, act=act, dtype=dtype), ConvNormLayer(device, operations, c4, c4, 3, 1, act=act, dtype=dtype))
+        self.cv3 = nn.Sequential(CSPLayer(device, operations, c4, c4, n, 1.0, act=act, dtype=dtype), ConvNormLayer(device, operations, c4, c4, 3, 1, act=act, dtype=dtype))
+        self.cv4 = ConvNormLayer(device, operations, c3 + 2 * c4, c2, 1, 1, act=act, dtype=dtype)
 
     def forward(self, x):
         y = list(self.cv1(x).split((self.c, self.c), 1))
@@ -194,17 +193,17 @@ class RepNCSPELAN4(nn.Module):
 
 class SCDown(nn.Module):
     """Separable conv downsampling used in HybridEncoder PAN bottom-up path."""
-    def __init__(self, ic, oc, k, s, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, ic, oc, k, s, dtype=None):
         super().__init__()
-        self.cv1 = ConvNormLayer(ic, oc, 1, 1, device=device, dtype=dtype, operations=operations)
-        self.cv2 = ConvNormLayer(oc, oc, k, s, g=oc, device=device, dtype=dtype, operations=operations)
+        self.cv1 = ConvNormLayer(device, operations, ic, oc, 1, 1, dtype=dtype)
+        self.cv2 = ConvNormLayer(device, operations, oc, oc, k, s, g=oc, dtype=dtype)
 
     def forward(self, x):
         return self.cv2(self.cv1(x))
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, embed_dim, num_heads, dtype=None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -213,19 +212,19 @@ class SelfAttention(nn.Module):
         self.k_proj   = operations.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
         self.v_proj   = operations.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
         self.out_proj = operations.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
+        self.optimized_attention = optimized_attention_for_device(device, small_input=True)
 
     def forward(self, query, key, value, attn_mask=None):
-        optimized_attention = optimized_attention_for_device(query.device, False, small_input=True)
         q, k, v = self.q_proj(query), self.k_proj(key), self.v_proj(value)
-        out = optimized_attention(q, k, v, heads=self.num_heads, mask=attn_mask)
+        out = self.optimized_attention(q, k, v, heads=self.num_heads, mask=attn_mask)
         return self.out_proj(out)
 
 
 class _TransformerEncoderLayer(nn.Module):
     """Single AIFI encoder layer (pre- or post-norm, GELU by default)."""
-    def __init__(self, d_model, nhead, dim_feedforward, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, d_model, nhead, dim_feedforward, dtype=None):
         super().__init__()
-        self.self_attn  = SelfAttention(d_model, nhead, device=device, dtype=dtype, operations=operations)
+        self.self_attn  = SelfAttention(device, operations, d_model, nhead, dtype=dtype)
         self.linear1    = operations.Linear(d_model, dim_feedforward, device=device, dtype=dtype)
         self.linear2    = operations.Linear(dim_feedforward, d_model, device=device, dtype=dtype)
         self.norm1      = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -242,10 +241,10 @@ class _TransformerEncoderLayer(nn.Module):
 
 class _TransformerEncoder(nn.Module):
     """Thin wrapper so state-dict keys are  encoder.0.layers.N.*"""
-    def __init__(self, num_layers, d_model, nhead, dim_feedforward, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, num_layers, d_model, nhead, dim_feedforward, dtype=None):
         super().__init__()
         self.layers = nn.ModuleList([
-            _TransformerEncoderLayer(d_model, nhead, dim_feedforward, device=device, dtype=dtype, operations=operations)
+            _TransformerEncoderLayer(device, operations, d_model, nhead, dim_feedforward, dtype=dtype)
             for _ in range(num_layers)
         ])
 
@@ -256,8 +255,8 @@ class _TransformerEncoder(nn.Module):
 
 
 class HybridEncoder(nn.Module):
-    def __init__(self, in_channels=(512, 1024, 2048), feat_strides=(8, 16, 32), hidden_dim=256, nhead=8, dim_feedforward=2048, use_encoder_idx=(2,), num_encoder_layers=1,
-                 pe_temperature=10000, expansion=1.0, depth_mult=1.0, act='silu', eval_spatial_size=(640, 640), device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, in_channels=(512, 1024, 2048), feat_strides=(8, 16, 32), hidden_dim=256, nhead=8, dim_feedforward=2048, use_encoder_idx=(2,), num_encoder_layers=1,
+                 pe_temperature=10000, expansion=1.0, depth_mult=1.0, act='silu', eval_spatial_size=(640, 640), dtype=None):
         super().__init__()
         self.in_channels       = list(in_channels)
         self.feat_strides      = list(feat_strides)
@@ -276,7 +275,7 @@ class HybridEncoder(nn.Module):
 
         # AIFI transformer — use _TransformerEncoder so keys are  encoder.0.layers.N.*
         self.encoder = nn.ModuleList([
-            _TransformerEncoder(num_encoder_layers, hidden_dim, nhead, dim_feedforward, device=device, dtype=dtype, operations=operations)
+            _TransformerEncoder(device, operations, num_encoder_layers, hidden_dim, nhead, dim_feedforward, dtype=dtype)
             for _ in range(len(use_encoder_idx))
         ])
 
@@ -285,40 +284,45 @@ class HybridEncoder(nn.Module):
 
         # top-down FPN  (dfine: lateral conv has no act)
         self.lateral_convs = nn.ModuleList(
-            [ConvNormLayer(hidden_dim, hidden_dim, 1, 1, device=device, dtype=dtype, operations=operations)
+            [ConvNormLayer(device, operations, hidden_dim, hidden_dim, 1, 1, dtype=dtype)
              for _ in range(len(in_channels) - 1)])
         self.fpn_blocks = nn.ModuleList(
-            [RepNCSPELAN4(hidden_dim * 2, hidden_dim, hidden_dim * 2, round(exp * hidden_dim // 2), nb, act=act, device=device, dtype=dtype, operations=operations)
+            [RepNCSPELAN4(device, operations, hidden_dim * 2, hidden_dim, hidden_dim * 2, round(exp * hidden_dim // 2), nb, act=act, dtype=dtype)
              for _ in range(len(in_channels) - 1)])
 
         # bottom-up PAN  (dfine: nn.Sequential(SCDown) — keeps checkpoint key  .0.cv1/.0.cv2)
         self.downsample_convs = nn.ModuleList(
-            [nn.Sequential(SCDown(hidden_dim, hidden_dim, 3, 2, device=device, dtype=dtype, operations=operations))
+            [nn.Sequential(SCDown(device, operations, hidden_dim, hidden_dim, 3, 2, dtype=dtype))
              for _ in range(len(in_channels) - 1)])
         self.pan_blocks = nn.ModuleList(
-            [RepNCSPELAN4(hidden_dim * 2, hidden_dim, hidden_dim * 2, round(exp * hidden_dim // 2), nb, act=act, device=device, dtype=dtype, operations=operations)
+            [RepNCSPELAN4(device, operations, hidden_dim * 2, hidden_dim, hidden_dim * 2, round(exp * hidden_dim // 2), nb, act=act, dtype=dtype)
              for _ in range(len(in_channels) - 1)])
 
-        # cache positional embeddings for fixed spatial size
+        # cache positional embeddings for fixed spatial size; register as
+        # buffers so checkpoint values override the freshly-computed defaults.
+        # (Plain setattr does not register a buffer: the tensor would sit in
+        # __dict__, stay on its init device across module.to() moves, and
+        # drop out of the state dict.)
         if eval_spatial_size:
             for idx in self.use_encoder_idx:
                 stride = self.feat_strides[idx]
-                pe = self._build_pe(eval_spatial_size[1] // stride,
+                pe = self._build_pe(device, dtype,
+                                    eval_spatial_size[1] // stride,
                                     eval_spatial_size[0] // stride,
                                     hidden_dim, pe_temperature)
-                setattr(self, f'pos_embed{idx}', pe)
+                self.register_buffer(f'pos_embed{idx}', pe)
 
     @staticmethod
-    def _build_pe(w, h, dim=256, temp=10000.):
+    def _build_pe(device, dtype, w, h, dim=256, temp=10000.):
         assert dim % 4 == 0
-        gw = torch.arange(w, dtype=torch.float32)
-        gh = torch.arange(h, dtype=torch.float32)
-        gw, gh = torch.meshgrid(gw, gh, indexing='ij')
+        gw = torch.arange(w, dtype=torch.float32, device=device)
+        gh = torch.arange(h, dtype=torch.float32, device=device)
+        gw, gh = torch.meshgrid(gw, gh, indexing='ij')  # TODO: use 'xy' to match flatten(2) token order.
         pdim  = dim // 4
-        omega = 1. / (temp ** (torch.arange(pdim, dtype=torch.float32) / pdim))
+        omega = 1. / (temp ** (torch.arange(pdim, dtype=torch.float32, device=device) / pdim))
         ow = gw.flatten()[:, None] @ omega[None]
         oh = gh.flatten()[:, None] @ omega[None]
-        return torch.cat([ow.sin(), ow.cos(), oh.sin(), oh.cos()], 1)[None]
+        return torch.cat([ow.sin(), ow.cos(), oh.sin(), oh.cos()], 1)[None].to(dtype)
 
     def forward(self, feats: List[torch.Tensor]) -> List[torch.Tensor]:
         proj = [self.input_proj[i](f) for i, f in enumerate(feats)]
@@ -326,7 +330,7 @@ class HybridEncoder(nn.Module):
         for i, enc_idx in enumerate(self.use_encoder_idx):
             h, w = proj[enc_idx].shape[2:]
             src  = proj[enc_idx].flatten(2).permute(0, 2, 1)
-            pe = getattr(self, f'pos_embed{enc_idx}').to(device=src.device, dtype=src.dtype)
+            pe = getattr(self, f'pos_embed{enc_idx}')
             for layer in self.encoder[i].layers:
                 src = layer(src, pos_embed=pe)
             proj[enc_idx] = src.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
@@ -380,7 +384,7 @@ def _deformable_attn_v2(value: list, spatial_shapes, sampling_locations: torch.T
 
 
 class MSDeformableAttention(nn.Module):
-    def __init__(self, embed_dim=256, num_heads=8, num_levels=3, num_points=4, offset_scale=0.5, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, embed_dim=256, num_heads=8, num_levels=3, num_points=4, offset_scale=0.5, dtype=None):
         super().__init__()
         self.embed_dim, self.num_heads = embed_dim, num_heads
         self.head_dim  = embed_dim // num_heads
@@ -388,7 +392,7 @@ class MSDeformableAttention(nn.Module):
         self.num_points_list = pts
         self.offset_scale    = offset_scale
         total = num_heads * sum(pts)
-        self.register_buffer('num_points_scale', torch.tensor([1. / n for n in pts for _ in range(n)], dtype=torch.float32))
+        self.register_buffer('num_points_scale', torch.tensor([1. / n for n in pts for _ in range(n)], dtype=dtype, device=device))
         self.sampling_offsets  = operations.Linear(embed_dim, total * 2, device=device, dtype=dtype)
         self.attention_weights = operations.Linear(embed_dim, total, device=device, dtype=dtype)
 
@@ -399,14 +403,14 @@ class MSDeformableAttention(nn.Module):
         attn_w  = F.softmax(
             self.attention_weights(query).reshape(
                 bs, Lq, self.num_heads, sum(self.num_points_list)), -1)
-        scale   = self.num_points_scale.to(query).unsqueeze(-1)
+        scale   = self.num_points_scale.unsqueeze(-1)
         offset  = offsets * scale * ref_pts[:, :, None, :, 2:] * self.offset_scale
         locs    = ref_pts[:, :, None, :, :2] + offset  # [bs, Lq, n_head, sum_pts, 2]
         return _deformable_attn_v2(value, spatial_shapes, locs, attn_w, self.num_points_list)
 
 
 class Gate(nn.Module):
-    def __init__(self, d_model, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, d_model, dtype=None):
         super().__init__()
         self.gate = operations.Linear(2 * d_model, 2 * d_model, device=device, dtype=dtype)
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -417,7 +421,7 @@ class Gate(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, num_layers, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, in_dim, hidden_dim, out_dim, num_layers, dtype=None):
         super().__init__()
         dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
         self.layers = nn.ModuleList(operations.Linear(dims[i], dims[i + 1], device=device, dtype=dtype) for i in range(num_layers))
@@ -429,12 +433,12 @@ class MLP(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, d_model=256, nhead=8, dim_feedforward=1024, num_levels=3, num_points=4, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, d_model=256, nhead=8, dim_feedforward=1024, num_levels=3, num_points=4, dtype=None):
         super().__init__()
-        self.self_attn  = SelfAttention(d_model, nhead, device=device, dtype=dtype, operations=operations)
+        self.self_attn  = SelfAttention(device, operations, d_model, nhead, dtype=dtype)
         self.norm1      = operations.LayerNorm(d_model, device=device, dtype=dtype)
-        self.cross_attn = MSDeformableAttention(d_model, nhead, num_levels, num_points, device=device, dtype=dtype, operations=operations)
-        self.gateway    = Gate(d_model, device=device, dtype=dtype, operations=operations)
+        self.cross_attn = MSDeformableAttention(device, operations, d_model, nhead, num_levels, num_points, dtype=dtype)
+        self.gateway    = Gate(device, operations, d_model, dtype=dtype)
         self.linear1    = operations.Linear(d_model, dim_feedforward, device=device, dtype=dtype)
         self.activation = nn.ReLU()
         self.linear2    = operations.Linear(dim_feedforward, d_model, device=device, dtype=dtype)
@@ -470,7 +474,7 @@ def weighting_function(reg_max, up, reg_scale):
 
 def distance2bbox(points, distance, reg_scale):
     """Decode edge-distances → cxcywh boxes."""
-    rs = abs(reg_scale).to(dtype=points.dtype)
+    rs = abs(reg_scale)
     x1 = points[..., 0] - (0.5 * rs + distance[..., 0]) * (points[..., 2] / rs)
     y1 = points[..., 1] - (0.5 * rs + distance[..., 1]) * (points[..., 3] / rs)
     x2 = points[..., 0] + (0.5 * rs + distance[..., 2]) * (points[..., 2] / rs)
@@ -488,16 +492,16 @@ class Integral(nn.Module):
     def forward(self, x, project):
         shape = x.shape
         x = F.softmax(x.reshape(-1, self.reg_max + 1), 1)
-        x = F.linear(x, project.to(device=x.device, dtype=x.dtype)).reshape(-1, 4)
+        x = F.linear(x, project).reshape(-1, 4)
         return x.reshape(list(shape[:-1]) + [-1])
 
 
 class LQE(nn.Module):
     """Location Quality Estimator — refines class scores using corner distribution."""
-    def __init__(self, k=4, hidden_dim=64, num_layers=2, reg_max=32, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, k=4, hidden_dim=64, num_layers=2, reg_max=32, dtype=None):
         super().__init__()
         self.k, self.reg_max = k, reg_max
-        self.reg_conf = MLP(4 * (k + 1), hidden_dim, 1, num_layers, device=device, dtype=dtype, operations=operations)
+        self.reg_conf = MLP(device, operations, 4 * (k + 1), hidden_dim, 1, num_layers, dtype=dtype)
 
     def forward(self, scores, pred_corners):
         B, L, _ = pred_corners.shape
@@ -508,7 +512,7 @@ class LQE(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, hidden_dim, nhead, dim_feedforward, num_levels, num_points, num_layers, reg_max, reg_scale, up, eval_idx=-1, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, hidden_dim, nhead, dim_feedforward, num_levels, num_points, num_layers, reg_max, reg_scale, up, eval_idx=-1, dtype=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -516,10 +520,10 @@ class TransformerDecoder(nn.Module):
         self.eval_idx   = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         self.up, self.reg_scale, self.reg_max = up, reg_scale, reg_max
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, num_levels, num_points, device=device, dtype=dtype, operations=operations)
+            TransformerDecoderLayer(device, operations, hidden_dim, nhead, dim_feedforward, num_levels, num_points, dtype=dtype)
             for _ in range(self.eval_idx + 1)
         ])
-        self.lqe_layers = nn.ModuleList([LQE(4, 64, 2, reg_max, device=device, dtype=dtype, operations=operations) for _ in range(self.eval_idx + 1)])
+        self.lqe_layers = nn.ModuleList([LQE(device, operations, 4, 64, 2, reg_max, dtype=dtype) for _ in range(self.eval_idx + 1)])
         self.register_buffer('project', weighting_function(reg_max, up, reg_scale))
 
     def _value_op(self, memory, spatial_shapes):
@@ -575,9 +579,9 @@ class TransformerDecoder(nn.Module):
 
 
 class DFINETransformer(nn.Module):
-    def __init__(self, num_classes=80, hidden_dim=256, num_queries=300, feat_channels=[256, 256, 256], feat_strides=[8, 16, 32],
+    def __init__(self, device, operations, num_classes=80, hidden_dim=256, num_queries=300, feat_channels=[256, 256, 256], feat_strides=[8, 16, 32],
                  num_levels=3, num_points=[3, 6, 3], nhead=8, num_layers=6, dim_feedforward=1024, eval_idx=-1, eps=1e-2, reg_max=32,
-                 reg_scale=8.0, eval_spatial_size=(640, 640), device=None, dtype=None, operations=None):
+                 reg_scale=8.0, eval_spatial_size=(640, 640), dtype=None):
         super().__init__()
         assert len(feat_strides) == len(feat_channels)
         self.hidden_dim  = hidden_dim
@@ -606,49 +610,49 @@ class DFINETransformer(nn.Module):
             in_ch = hidden_dim
 
         # FDR parameters (non-trainable placeholders, set from config)
-        self.up        = nn.Parameter(torch.tensor([0.5]),      requires_grad=False)
-        self.reg_scale = nn.Parameter(torch.tensor([reg_scale]), requires_grad=False)
+        self.up        = nn.Parameter(torch.tensor([0.5], device=device, dtype=dtype),      requires_grad=False)
+        self.reg_scale = nn.Parameter(torch.tensor([reg_scale], device=device, dtype=dtype), requires_grad=False)
 
         pts = num_points if isinstance(num_points, (list, tuple)) else [num_points] * num_levels
-        self.decoder = TransformerDecoder(hidden_dim, nhead, dim_feedforward, num_levels, pts,
-                                          num_layers, reg_max, self.reg_scale, self.up, eval_idx, device=device, dtype=dtype, operations=operations)
+        self.decoder = TransformerDecoder(device, operations, hidden_dim, nhead, dim_feedforward, num_levels, pts,
+                                          num_layers, reg_max, self.reg_scale, self.up, eval_idx, dtype=dtype)
 
-        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, device=device, dtype=dtype, operations=operations)
+        self.query_pos_head = MLP(device, operations, 4, 2 * hidden_dim, hidden_dim, 2, dtype=dtype)
         self.enc_output     = nn.Sequential(OrderedDict([
             ('proj', operations.Linear(hidden_dim, hidden_dim, device=device, dtype=dtype)),
             ('norm', operations.LayerNorm(hidden_dim, device=device, dtype=dtype))]))
         self.enc_score_head = operations.Linear(hidden_dim, num_classes, device=device, dtype=dtype)
-        self.enc_bbox_head  = MLP(hidden_dim, hidden_dim, 4, 3, device=device, dtype=dtype, operations=operations)
+        self.enc_bbox_head  = MLP(device, operations, hidden_dim, hidden_dim, 4, 3, dtype=dtype)
 
         self.eval_idx_ = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         self.dec_score_head = nn.ModuleList(
             [operations.Linear(hidden_dim, num_classes, device=device, dtype=dtype) for _ in range(self.eval_idx_ + 1)])
-        self.pre_bbox_head  = MLP(hidden_dim, hidden_dim, 4, 3, device=device, dtype=dtype, operations=operations)
+        self.pre_bbox_head  = MLP(device, operations, hidden_dim, hidden_dim, 4, 3, dtype=dtype)
         self.dec_bbox_head  = nn.ModuleList(
-            [MLP(hidden_dim, hidden_dim, 4 * (reg_max + 1), 3, device=device, dtype=dtype, operations=operations)
+            [MLP(device, operations, hidden_dim, hidden_dim, 4 * (reg_max + 1), 3, dtype=dtype)
              for _ in range(self.eval_idx_ + 1)])
         self.integral = Integral(reg_max)
 
         if eval_spatial_size:
             # Register as buffers so checkpoint values override the freshly-computed defaults
-            anchors, valid_mask = self._gen_anchors()
+            anchors, valid_mask = self._gen_anchors(device, dtype)
             self.register_buffer('anchors', anchors)
             self.register_buffer('valid_mask', valid_mask)
 
-    def _gen_anchors(self, spatial_shapes=None, grid_size=0.05, dtype=torch.float32, device='cpu'):
+    def _gen_anchors(self, device, dtype, spatial_shapes=None, grid_size=0.05):
         if spatial_shapes is None:
             h0, w0 = self.eval_spatial_size
             spatial_shapes = [[int(h0 / s), int(w0 / s)] for s in self.feat_strides]
         anchors = []
         for lvl, (h, w) in enumerate(spatial_shapes):
-            gy, gx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-            gxy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([w, h], dtype=dtype)
+            gy, gx = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
+            gxy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([w, h], dtype=dtype, device=device)
             wh  = torch.ones_like(gxy) * grid_size * (2. ** lvl)
             anchors.append(torch.cat([gxy, wh], -1).reshape(-1, h * w, 4))
-        anchors    = torch.cat(anchors, 1).to(device)
+        anchors    = torch.cat(anchors, 1)
         valid_mask = ((anchors > self.eps) & (anchors < 1 - self.eps)).all(-1, keepdim=True)
         anchors    = torch.log(anchors / (1 - anchors))
-        anchors    = torch.where(valid_mask, anchors, torch.full_like(anchors, float('inf')))
+        anchors    = torch.where(valid_mask, anchors, torch.full_like(anchors, float('inf'))).to(dtype)
         return anchors, valid_mask
 
     def _encoder_input(self, feats: List[torch.Tensor]):
@@ -663,11 +667,11 @@ class DFINETransformer(nn.Module):
         return torch.cat(flat, 1), shapes
 
     def _decoder_input(self, memory: torch.Tensor):
-        anchors, valid_mask = self.anchors.to(memory), self.valid_mask
+        anchors, valid_mask = self.anchors, self.valid_mask
         if memory.shape[0] > 1:
             anchors = anchors.repeat(memory.shape[0], 1, 1)
 
-        mem      = valid_mask.to(memory) * memory
+        mem      = valid_mask * memory
         out_mem  = self.enc_output(mem)
         logits   = self.enc_score_head(out_mem)
         _, idx   = torch.topk(logits.max(-1).values, self.num_queries, dim=-1)
@@ -692,23 +696,16 @@ class DFINETransformer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RTv4(nn.Module):
-    def __init__(self, device, num_classes=80, num_queries=300, enc_h=256, dec_h=256, enc_ff=2048, dec_ff=1024, feat_strides=[8, 16, 32], dtype=None, operations=None, **kwargs):
+    def __init__(self, device, operations, num_classes=80, num_queries=300, enc_h=256, dec_h=256, enc_ff=2048, dec_ff=1024, feat_strides=[8, 16, 32], dtype=None, **kwargs):
         super().__init__()
-        self.device = device
-        self.dtype = dtype
-        self.operations = operations
 
-        self.backbone = HGNetv2(device=device, dtype=dtype, operations=operations)
-        self.encoder  = HybridEncoder(hidden_dim=enc_h, dim_feedforward=enc_ff, device=device, dtype=dtype, operations=operations)
-        self.decoder  = DFINETransformer(num_classes=num_classes, hidden_dim=dec_h, num_queries=num_queries,
-            feat_channels=[enc_h] * len(feat_strides), feat_strides=feat_strides, dim_feedforward=dec_ff, device=device, dtype=dtype, operations=operations)
+        self.backbone = HGNetv2(device, operations, dtype=dtype)
+        self.encoder  = HybridEncoder(device, operations, hidden_dim=enc_h, dim_feedforward=enc_ff, dtype=dtype)
+        self.decoder  = DFINETransformer(device, operations, num_classes=num_classes, hidden_dim=dec_h, num_queries=num_queries,
+            feat_channels=[enc_h] * len(feat_strides), feat_strides=feat_strides, dim_feedforward=dec_ff, dtype=dtype)
 
         self.num_classes = num_classes
         self.num_queries = num_queries
-        self.load_device = comfy.model_management.get_torch_device()
-
-    def _forward(self, x: torch.Tensor):
-        return self.decoder(self.encoder(self.backbone(x)))
 
     def postprocess(self, outputs, orig_size: tuple = (640, 640)) -> List[dict]:
         logits = outputs['pred_logits']
@@ -721,5 +718,5 @@ class RTv4(nn.Module):
         return [{'labels': lbl, 'boxes': b, 'scores': s} for lbl, b, s in zip(labels, boxes, scores)]
 
     def forward(self, x: torch.Tensor, orig_size: tuple = (640, 640), **kwargs):
-        outputs = self._forward(x.to(device=self.load_device, dtype=self.dtype))
+        outputs = self.decoder(self.encoder(self.backbone(x)))
         return self.postprocess(outputs, orig_size)

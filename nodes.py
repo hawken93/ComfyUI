@@ -601,17 +601,19 @@ class CheckpointLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "config_name": (folder_paths.get_filename_list("configs"), ),
-                              "ckpt_name": (folder_paths.get_filename_list("checkpoints"), )}}
+                              "ckpt_name": (folder_paths.get_filename_list("checkpoints"), )},
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}}
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     FUNCTION = "load_checkpoint"
 
     CATEGORY = "model/loaders"
     DEPRECATED = True
 
-    def load_checkpoint(self, config_name, ckpt_name):
+    def load_checkpoint(self, config_name, ckpt_name, device="default"):
         config_path = folder_paths.get_full_path("configs", config_name)
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-        return comfy.sd.load_checkpoint(config_path, ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+        load_device = comfy.model_management.pick_device_for_option(device)
+        return comfy.sd.load_checkpoint(ckpt_path, load_device, comfy.model_management.unet_offload_device(load_device), config_path=config_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
 
 class CheckpointLoaderSimple:
     @classmethod
@@ -619,7 +621,8 @@ class CheckpointLoaderSimple:
         return {
             "required": {
                 "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {"tooltip": "The name of the checkpoint (model) to load."}),
-            }
+            },
+            "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}
         }
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     OUTPUT_TOOLTIPS = ("The model used for denoising latents.",
@@ -631,9 +634,10 @@ class CheckpointLoaderSimple:
     DESCRIPTION = "Loads a diffusion model checkpoint, diffusion models are used to denoise latents."
     SEARCH_ALIASES = ["load model", "checkpoint", "model loader", "load checkpoint", "ckpt", "model"]
 
-    def load_checkpoint(self, ckpt_name):
+    def load_checkpoint(self, ckpt_name, device="default"):
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+        load_device = comfy.model_management.pick_device_for_option(device)
+        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, load_device, comfy.model_management.unet_offload_device(load_device), output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         return out[:3]
 
 class DiffusersLoader:
@@ -652,7 +656,7 @@ class DiffusersLoader:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"model_path": (cls._model_paths(),),},
-                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True})}}
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}}
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     FUNCTION = "load_checkpoint"
     DEPRECATED = True
@@ -682,16 +686,17 @@ class DiffusersLoader:
 class unCLIPCheckpointLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
-                             }}
+        return {"required": { "ckpt_name": (folder_paths.get_filename_list("checkpoints"), )},
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}}
     RETURN_TYPES = ("MODEL", "CLIP", "VAE", "CLIP_VISION")
     FUNCTION = "load_checkpoint"
 
     CATEGORY = "model/loaders"
 
-    def load_checkpoint(self, ckpt_name, output_vae=True, output_clip=True):
+    def load_checkpoint(self, ckpt_name, output_vae=True, output_clip=True, device="default"):
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
-        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+        load_device = comfy.model_management.pick_device_for_option(device)
+        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, load_device, comfy.model_management.unet_offload_device(load_device), output_vae=True, output_clip=True, output_clipvision=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         return out
 
 class CLIPSetLastLayer:
@@ -1012,14 +1017,14 @@ class UNETLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
-                              "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], {"advanced": True})
-                             }}
+                              "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], {"advanced": True})},
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
 
     CATEGORY = "model/loaders"
 
-    def load_unet(self, unet_name, weight_dtype):
+    def load_unet(self, unet_name, weight_dtype, device="default"):
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
@@ -1030,7 +1035,8 @@ class UNETLoader:
             model_options["dtype"] = torch.float8_e5m2
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
+        load_device = comfy.model_management.pick_device_for_option(device)
+        model = comfy.sd.load_diffusion_model(unet_path, load_device, comfy.model_management.unet_offload_device(load_device), model_options=model_options)
         return (model,)
 
 class CLIPLoader:
@@ -1228,16 +1234,25 @@ class unCLIPConditioning:
 class GLIGENLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "gligen_name": (folder_paths.get_filename_list("gligen"), )}}
+        return {"required": {"gligen_name": (folder_paths.get_filename_list("gligen"), )},
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(),
+                                        {"advanced": True,
+                                         "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."
+                                        })
+                            }
+               }
 
     RETURN_TYPES = ("GLIGEN",)
     FUNCTION = "load_gligen"
 
     CATEGORY = "model/loaders"
 
-    def load_gligen(self, gligen_name):
+    def load_gligen(self, gligen_name, device="default"):
         gligen_path = folder_paths.get_full_path_or_raise("gligen", gligen_name)
-        gligen = comfy.sd.load_gligen(gligen_path)
+        # TODO: add a prefer-dtype mode to pick_device_for_option (dtype currently only supports require); a non-fp16 pick is safe here since load_gligen keeps the model fp32 when should_use_fp16() says no
+        load_device = comfy.model_management.pick_device_for_option(device, dtype=torch.float16)
+        offload_device = comfy.model_management.unet_offload_device(load_device)
+        gligen = comfy.sd.load_gligen(gligen_path, load_device, offload_device)
         return (gligen,)
 
 class GLIGENTextBoxApply:

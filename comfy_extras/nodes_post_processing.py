@@ -97,7 +97,6 @@ class Blur(io.ComfyNode):
         if blur_radius == 0:
             return io.NodeOutput(image)
 
-        image = image.to(comfy.model_management.get_torch_device())
         batch_size, height, width, channels = image.shape
 
         kernel_size = blur_radius * 2 + 1
@@ -108,7 +107,8 @@ class Blur(io.ComfyNode):
         blurred = F.conv2d(padded_image, kernel, padding=kernel_size // 2, groups=channels)[:,:,blur_radius:-blur_radius, blur_radius:-blur_radius]
         blurred = blurred.permute(0, 2, 3, 1)
 
-        return io.NodeOutput(blurred.to(comfy.model_management.intermediate_device()))
+        intermediate_device = comfy.model_management.intermediate_device(image.device)
+        return io.NodeOutput(blurred.to(intermediate_device))
 
 
 class Quantize(io.ComfyNode):
@@ -201,7 +201,6 @@ class Sharpen(io.ComfyNode):
             return io.NodeOutput(image)
 
         batch_size, height, width, channels = image.shape
-        image = image.to(comfy.model_management.get_torch_device())
 
         kernel_size = sharpen_radius * 2 + 1
         kernel = gaussian_kernel(kernel_size, sigma, device=image.device, dtype=image.dtype) * -(alpha*10)
@@ -217,7 +216,8 @@ class Sharpen(io.ComfyNode):
 
         result = torch.clamp(sharpened, 0, 1)
 
-        return io.NodeOutput(result.to(comfy.model_management.intermediate_device()))
+        intermediate_device = comfy.model_management.intermediate_device(image.device)
+        return io.NodeOutput(result.to(intermediate_device))
 
 class ImageScaleToTotalPixels(io.ComfyNode):
     upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
@@ -845,8 +845,8 @@ class ColorTransfer(io.ComfyNode):
         if strength == 0 or image_ref is None:
             return io.NodeOutput(image_target)
 
-        device = comfy.model_management.get_torch_device()
-        intermediate_device = comfy.model_management.intermediate_device()
+        device = image_target.device
+        intermediate_device = comfy.model_management.intermediate_device(device)
         intermediate_dtype = comfy.model_management.intermediate_dtype()
 
         B, H, W, C = image_target.shape

@@ -117,6 +117,9 @@ class SAM3_Detect(io.ComfyNode):
         B, H, W, C = image.shape
         image_in = comfy.utils.common_upscale(image[..., :3].movedim(-1, 1), 1008, 1008, "bilinear", crop="disabled")
 
+        device = model.load_device
+        dtype = model.model.get_dtype()
+
         # Convert bboxes to normalized cxcywh format, per-frame list of [1, N, 4] tensors.
         # Supports: single dict (all frames), list[dict] (all frames), list[list[dict]] (per-frame).
         def _boxes_to_tensor(box_list):
@@ -149,10 +152,12 @@ class SAM3_Detect(io.ComfyNode):
         neg_pts = json.loads(negative_coords) if negative_coords else []
         has_points = len(pos_pts) > 0 or len(neg_pts) > 0
 
+        # This puts the model on the execution device,
+        # if it was offloaded to save memory, this is when it comes back in
         comfy.model_management.load_model_gpu(model)
-        device = comfy.model_management.get_torch_device()
-        dtype = model.model.get_dtype()
+
         sam3_model = model.model.diffusion_model
+        intermediate_device = comfy.model_management.intermediate_device(device)
 
         # Build point inputs for tracker SAM decoder path
         point_inputs = None
@@ -244,13 +249,12 @@ class SAM3_Detect(io.ComfyNode):
                     all_masks.append((combined > 0).any(dim=0).float())
             else:
                 if individual_masks:
-                    all_masks.append(torch.zeros(0, H, W, device=comfy.model_management.intermediate_device()))
+                    all_masks.append(torch.zeros(0, H, W, device=intermediate_device))
                 else:
-                    all_masks.append(torch.zeros(H, W, device=comfy.model_management.intermediate_device()))
+                    all_masks.append(torch.zeros(H, W, device=intermediate_device))
             pbar.update(1)
 
-        idev = comfy.model_management.intermediate_device()
-        all_masks = [m.to(idev) for m in all_masks]
+        all_masks = [m.to(intermediate_device) for m in all_masks]
         mask_out = torch.cat(all_masks, dim=0) if individual_masks else torch.stack(all_masks)
         return io.NodeOutput(mask_out, all_bbox_dicts)
 
@@ -286,7 +290,7 @@ class SAM3_VideoTrack(io.ComfyNode):
         N, H, W, C = images.shape
 
         comfy.model_management.load_model_gpu(model)
-        device = comfy.model_management.get_torch_device()
+        device = model.load_device
         dtype = model.model.get_dtype()
         sam3_model = model.model.diffusion_model
 
@@ -405,11 +409,12 @@ class SAM3_TrackPreview(io.ComfyNode):
             H, W = images.shape[1], images.shape[2]
         if packed is None:
             N, N_obj = track_data["n_frames"], 0
+            device = images.device if images is not None else torch.device("cpu")
         else:
             N, N_obj = packed.shape[0], packed.shape[1]
+            device = packed.device
 
         import uuid
-        gpu = comfy.model_management.get_torch_device()
         temp_dir = folder_paths.get_temp_directory()
         filename = f"sam3_track_preview_{uuid.uuid4().hex[:8]}.mp4"
         filepath = os.path.join(temp_dir, filename)
@@ -423,19 +428,19 @@ class SAM3_TrackPreview(io.ComfyNode):
             frame_np = frame_cpu.numpy()
             if N_obj > 0:
                 colors_t = torch.tensor([cls.COLORS[i % len(cls.COLORS)] for i in range(N_obj)],
-                                       device=gpu, dtype=torch.float32)
-                grid_y = torch.arange(H, device=gpu).view(1, H, 1)
-                grid_x = torch.arange(W, device=gpu).view(1, 1, W)
+                                       device=device, dtype=torch.float32)
+                grid_y = torch.arange(H, device=device).view(1, H, 1)
+                grid_x = torch.arange(W, device=device).view(1, 1, W)
             for t in range(N):
                 if images is not None and t < images.shape[0]:
-                    frame = images[t].clone()
+                    frame = images[t].to(device).clone()
                 else:
-                    frame = torch.zeros(H, W, 3)
+                    frame = torch.zeros(H, W, 3, device=device)
 
                 if N_obj > 0:
-                    frame_binary = unpack_masks(packed[t:t+1].to(gpu))  # [1, N_obj, H, W] bool
+                    frame_binary = unpack_masks(packed[t:t+1])  # [1, N_obj, H, W] bool
                     frame_masks = F.interpolate(frame_binary.float(), size=(H, W), mode="nearest")[0]
-                    frame_gpu = frame.to(gpu)
+                    frame_gpu = frame
                     bool_masks = frame_masks > 0.5
                     any_mask = bool_masks.any(dim=0)
                     if any_mask.any():

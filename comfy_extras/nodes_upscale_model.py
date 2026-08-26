@@ -26,6 +26,8 @@ class UpscaleModelLoader(io.ComfyNode):
             category="model/loaders",
             inputs=[
                 io.Combo.Input("model_name", options=folder_paths.get_filename_list("upscale_models")),
+                io.Combo.Input("device", options=model_management.get_gpu_device_options(), optional=True, advanced=True, default="default",
+                               tooltip="Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."),
             ],
             outputs=[
                 io.UpscaleModel.Output(),
@@ -33,7 +35,7 @@ class UpscaleModelLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_name) -> io.NodeOutput:
+    def execute(cls, model_name, device="default") -> io.NodeOutput:
         model_path = folder_paths.get_full_path_or_raise("upscale_models", model_name)
         sd = comfy.utils.load_torch_file(model_path, safe_load=True)
         if "module.layers.0.residual_group.blocks.0.norm1.weight" in sd:
@@ -43,7 +45,12 @@ class UpscaleModelLoader(io.ComfyNode):
         if not isinstance(out, ImageModelDescriptor):
             raise Exception("Upscale model must be a single-image model.")
 
-        out.patcher = comfy.model_patcher.CoreModelPatcher(out.model, load_device=model_management.get_torch_device(), offload_device=model_management.unet_offload_device())
+        dtype = comfy.utils.weight_dtype(sd)
+        device = model_management.pick_device_for_option(
+            device,
+            memory_required=comfy.utils.calculate_parameters(sd) * model_management.dtype_size(dtype),
+            dtype=dtype)
+        out.patcher = comfy.model_patcher.CoreModelPatcher(out.model, load_device=device, offload_device=model_management.unet_offload_device(device))
         return io.NodeOutput(out)
 
     load_model = execute  # TODO: remove
@@ -79,7 +86,7 @@ class ImageUpscaleWithModel(io.ComfyNode):
         tile = 512
         overlap = 32
 
-        output_device = comfy.model_management.intermediate_device()
+        output_device = comfy.model_management.intermediate_device(device)
 
         oom = True
         while oom:

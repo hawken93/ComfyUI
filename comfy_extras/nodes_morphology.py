@@ -30,7 +30,7 @@ class Morphology(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, operation, kernel_size) -> io.NodeOutput:
-        device = comfy.model_management.get_torch_device()
+        device = image.device
         kernel = torch.ones(kernel_size, kernel_size, device=device)
         image_k = image.to(device).movedim(-1, 1)
         if operation == "erode":
@@ -49,7 +49,8 @@ class Morphology(io.ComfyNode):
             output = bottom_hat(image_k, kernel)
         else:
             raise ValueError(f"Invalid operation {operation} for morphology. Must be one of 'erode', 'dilate', 'open', 'close', 'gradient', 'tophat', 'bottomhat'")
-        img_out = output.to(comfy.model_management.intermediate_device()).movedim(1, -1)
+        intermediate_device = comfy.model_management.intermediate_device(device)
+        img_out = output.to(intermediate_device).movedim(1, -1)
         return io.NodeOutput(img_out)
 
 

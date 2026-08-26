@@ -2259,6 +2259,7 @@ class LongCatImage(supported_models_base.BASE):
 class RT_DETR_v4(supported_models_base.BASE):
     unet_config = {
         "image_model": "RT_DETR_v4",
+        "dtype": torch.float32,
     }
 
     supported_inference_dtypes = [torch.float16, torch.float32]

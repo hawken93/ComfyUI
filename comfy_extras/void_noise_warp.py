@@ -16,13 +16,11 @@ module never downloads weights at runtime.
 """
 
 import logging
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-import comfy.model_management
 
 
 # ---------------------------------------------------------------------------
@@ -354,11 +352,7 @@ class RaftOpticalFlow:
     ``nodes_void.py``).  ``__call__`` returns a ``(2, H, W)`` flow.
     """
 
-    def __init__(self, model, device=None):
-        if device is None:
-            device = comfy.model_management.get_torch_device()
-        device = torch.device(device) if not isinstance(device, torch.device) else device
-
+    def __init__(self, device, model):
         model = model.to(device)
         model.eval()
         self.device = device
@@ -396,14 +390,13 @@ class RaftOpticalFlow:
 # ---------------------------------------------------------------------------
 
 def get_noise_from_video(
+    device: torch.device,
     video_frames: torch.Tensor,
     raft: RaftOpticalFlow,
-    *,
     noise_channels: int = 16,
     resize_frames: float = 0.5,
     resize_flow: int = 8,
     downscale_factor: int = 32,
-    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """Produce optical-flow-warped gaussian noise from a video.
 
@@ -417,7 +410,7 @@ def get_noise_from_video(
             ``(resize_flow * resize_frames * H, resize_flow * resize_frames * W)``.
         downscale_factor: Area-pool factor applied to the noise before return;
             should evenly divide the internal noise resolution.
-        device: Target device.  Defaults to ``comfy.model_management.get_torch_device()``.
+        device: Target device.
 
     Returns:
         ``(T, H', W', noise_channels)`` float32 noise tensor on ``device``.
@@ -436,10 +429,6 @@ def get_noise_from_video(
             "get_noise_from_video: video_frames must be uint8 in [0, 255], "
             f"got dtype {video_frames.dtype}"
         )
-
-    if device is None:
-        device = comfy.model_management.get_torch_device()
-    device = torch.device(device) if not isinstance(device, torch.device) else device
 
     if device.type == "cpu":
         logging.warning(

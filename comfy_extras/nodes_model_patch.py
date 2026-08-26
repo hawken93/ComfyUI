@@ -230,26 +230,31 @@ class ModelPatchLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "name": (folder_paths.get_filename_list("model_patches"), ),
-                              }}
+                              },
+                "optional": {"device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device to run the model on. 'default' auto-picks. Unless VRAM is high, the model rests on CPU between runs and moves to the device when it runs."})}}
     RETURN_TYPES = ("MODEL_PATCH",)
     FUNCTION = "load_model_patch"
     EXPERIMENTAL = True
 
     CATEGORY = "model/loaders"
 
-    def load_model_patch(self, name):
+    def load_model_patch(self, name, device="default"):
         model_patch_path = folder_paths.get_full_path_or_raise("model_patches", name)
         sd, metadata = comfy.utils.load_torch_file(model_patch_path, safe_load=True, return_metadata=True)
         dtype = comfy.utils.weight_dtype(sd)
+        device = comfy.model_management.pick_device_for_option(
+            device,
+            memory_required=comfy.utils.calculate_parameters(sd) * comfy.model_management.dtype_size(dtype),
+            dtype=dtype)
 
         if 'lllite_conditioning1.conv1.weight' in sd:
-            model = comfy.ldm.anima.lllite.AnimaLLLite(sd, metadata, device=comfy.model_management.unet_offload_device(), dtype=dtype, operations=comfy.ops.manual_cast)
+            model = comfy.ldm.anima.lllite.AnimaLLLite(sd, metadata, device=comfy.model_management.unet_offload_device(device), dtype=dtype, operations=comfy.ops.manual_cast)
         elif 'controlnet_blocks.0.y_rms.weight' in sd:
             additional_in_dim = sd["img_in.weight"].shape[1] - 64
-            model = QwenImageBlockWiseControlNet(additional_in_dim=additional_in_dim, device=comfy.model_management.unet_offload_device(), dtype=dtype, operations=comfy.ops.manual_cast)
+            model = QwenImageBlockWiseControlNet(additional_in_dim=additional_in_dim, device=comfy.model_management.unet_offload_device(device), dtype=dtype, operations=comfy.ops.manual_cast)
         elif 'feature_embedder.mid_layer_norm.bias' in sd:
             sd = comfy.utils.state_dict_prefix_replace(sd, {"feature_embedder.": ""}, filter_keys=True)
-            model = SigLIPMultiFeatProjModel(device=comfy.model_management.unet_offload_device(), dtype=dtype, operations=comfy.ops.manual_cast)
+            model = SigLIPMultiFeatProjModel(device=comfy.model_management.unet_offload_device(device), dtype=dtype, operations=comfy.ops.manual_cast)
         elif 'control_all_x_embedder.2-1.weight' in sd: # alipai z image fun controlnet
             sd = z_image_convert(sd)
             config = {}
@@ -265,7 +270,7 @@ class ModelPatchLoader:
                 if ref_weight is not None:
                     if torch.count_nonzero(ref_weight) == 0:
                         config['broken'] = True
-            model = comfy.ldm.lumina.controlnet.ZImage_Control(device=comfy.model_management.unet_offload_device(), dtype=dtype, operations=comfy.ops.manual_cast, **config)
+            model = comfy.ldm.lumina.controlnet.ZImage_Control(device=comfy.model_management.unet_offload_device(device), dtype=dtype, operations=comfy.ops.manual_cast, **config)
         elif 'controlnet_patch_embedding.weight' in sd:  # Uni3C controlnet for Wan
             attn_key_replace = {".self_attn.to_q.": ".self_attn.q.",
                                 ".self_attn.to_k.": ".self_attn.k.",
@@ -294,7 +299,7 @@ class ModelPatchLoader:
                     out_proj_dim=sd["proj_out.0.weight"].shape[0],
                     add_channels=sd["controlnet_mask_embedding.mask_proj.0.weight"].shape[1],
                     mid_channels=sd["controlnet_mask_embedding.mask_proj.0.weight"].shape[0],
-                    device=comfy.model_management.unet_offload_device(),
+                    device=comfy.model_management.unet_offload_device(device),
                     dtype=dtype,
                     operations=comfy.ops.manual_cast)
         elif any(k.endswith("duration_head.attention_pooler.query_tokens") for k in sd) or "attention_pooler.query_tokens" in sd:
@@ -307,7 +312,7 @@ class ModelPatchLoader:
                     in_dim=sd["blocks.0.audio_cross_attn.proj.weight"].shape[0],
                     intermediate_dim=sd["audio_proj.proj1.weight"].shape[0],
                     out_dim=sd["audio_proj.norm.weight"].shape[0],
-                    device=comfy.model_management.unet_offload_device(),
+                    device=comfy.model_management.unet_offload_device(device),
                     operations=comfy.ops.manual_cast)
         elif 'model.control_model.input_hint_block.0.weight' in sd or 'control_model.input_hint_block.0.weight' in sd:
             prefix_replace = {}
@@ -327,11 +332,11 @@ class ModelPatchLoader:
 
             sd = comfy.utils.state_dict_prefix_replace(sd, prefix_replace, filter_keys=True)
             sd.pop("control_model.mask_LQ", None)
-            model = comfy.ldm.supir.supir_modules.SUPIR(device=comfy.model_management.unet_offload_device(), dtype=dtype, operations=comfy.ops.manual_cast)
+            model = comfy.ldm.supir.supir_modules.SUPIR(device=comfy.model_management.unet_offload_device(device), dtype=dtype, operations=comfy.ops.manual_cast)
             if denoise_encoder_sd:
                 model.denoise_encoder_sd = denoise_encoder_sd
 
-        model_patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=comfy.model_management.get_torch_device(), offload_device=comfy.model_management.unet_offload_device())
+        model_patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=device, offload_device=comfy.model_management.unet_offload_device(device))
         model.load_state_dict(sd, assign=model_patcher.is_dynamic())
         return (model_patcher,)
 
