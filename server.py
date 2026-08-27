@@ -685,7 +685,6 @@ class PromptServer():
 
         @routes.get("/system_stats")
         async def system_stats(request):
-            primary_device = comfy.model_management.get_torch_device()
             cpu_device = comfy.model_management.torch.device("cpu")
             ram_total = comfy.model_management.get_total_memory(cpu_device)
             ram_free = comfy.model_management.get_free_memory(cpu_device)
@@ -694,13 +693,7 @@ class PromptServer():
             required_templates_version = FrontendManager.get_required_templates_version()
             comfy_package_versions = FrontendManager.get_comfy_package_versions()
 
-            # Report every torch device visible to multigpu, with the primary
-            # device first so existing clients that read devices[0] keep working.
             torch_devices = comfy.model_management.get_all_torch_devices()
-            if primary_device in torch_devices:
-                torch_devices = [primary_device] + [d for d in torch_devices if d != primary_device]
-            else:
-                torch_devices = [primary_device] + list(torch_devices)
 
             device_entries = []
             for d in torch_devices:

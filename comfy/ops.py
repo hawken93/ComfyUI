@@ -76,7 +76,7 @@ try:
                 if q.nelement() < 1024 * 128:  # arbitrary number, for small inputs cudnn attention seems slower
                     return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
                 attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
-                if kwargs.get("enable_gqa", False) and attn_mask is not None and not comfy.model_management.is_nvidia():
+                if kwargs.get("enable_gqa", False) and attn_mask is not None and not comfy.model_management.is_nvidia(q.device):
                     k, v = repeat_kv_for_gqa(k, v, q.shape[-3], -3)
                     kwargs["enable_gqa"] = False
                 with sdpa_kernel(SDPA_BACKEND_PRIORITY, set_priority=True):
@@ -99,15 +99,15 @@ except (ModuleNotFoundError, TypeError):
     logging.warning("Could not set sdpa backend priority.")
 
 NVIDIA_MEMORY_CONV_BUG_WORKAROUND = False
-try:
-    if comfy.model_management.is_nvidia():
-        cudnn_version = torch.backends.cudnn.version()
-        if (cudnn_version >= 91002 and cudnn_version < 91500) and comfy.model_management.torch_version_numeric >= (2, 9) and comfy.model_management.torch_version_numeric <= (2, 10):
-            #TODO: change upper bound version once it's fixed'
-            NVIDIA_MEMORY_CONV_BUG_WORKAROUND = True
-            logging.info("working around nvidia conv3d memory bug.")
-except:
-    pass
+cudnn_version = torch.backends.cudnn.version()
+if (    cudnn_version is not None
+    and (cudnn_version >= 91002 and cudnn_version < 91500)
+    and comfy.model_management.torch_version_numeric >= (2, 9)
+    and comfy.model_management.torch_version_numeric <= (2, 10)):
+
+    #TODO: change upper bound version once it's fixed'
+    NVIDIA_MEMORY_CONV_BUG_WORKAROUND = True
+    logging.info("working around nvidia conv3d memory bug.")
 
 cast_to = comfy.model_management.cast_to #TODO: remove once no more references
 

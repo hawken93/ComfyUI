@@ -23,11 +23,11 @@ def _latent(t_latent, h=8, w=8, b=1):
     g = torch.Generator().manual_seed(7)
     return {"samples": torch.randn(b, SEEDVR2_LATENT_CHANNELS, t_latent, h, w, generator=g)}
 
-def _split(latent, frames_per_chunk, temporal_overlap, chunking_mode="manual"):
+def _split(latent, frames_per_chunk, temporal_overlap, chunking_mode="manual", model=None):
     combo = {"chunking_mode": chunking_mode}
     if chunking_mode != "auto":
         combo["frames_per_chunk"] = frames_per_chunk
-    return SeedVR2TemporalChunk.execute(latent, temporal_overlap, combo).args
+    return SeedVR2TemporalChunk.execute(latent, temporal_overlap, combo, model).args
 
 def _merge(chunks, temporal_overlap):
     return SeedVR2TemporalMerge.execute(chunks, [temporal_overlap]).args[0]
@@ -54,8 +54,9 @@ def test_chunk_auto_mode_applies_vram_law(monkeypatch):
         + 5.1 * SEEDVR2_CHUNK_GIB_PER_MPX_FRAME * mpx_per_frame
     )
     monkeypatch.setattr(comfy.model_management, "get_free_memory", lambda dev=None: free_gb * (1024 ** 3))
-    assert [c["samples"].shape[2] for c in _split(_latent(13, h=32, w=32), 1, 0, "auto")[0]] == [5, 5, 3]
-    assert _split(_latent(13, h=32, w=32, b=2), 1, 0, "auto")[0][0]["samples"].shape[2] == 2  # batch halves the chunk
+    model = type("StubPatcher", (), {"load_device": torch.device("cuda:0")})()
+    assert [c["samples"].shape[2] for c in _split(_latent(13, h=32, w=32), 1, 0, "auto", model)[0]] == [5, 5, 3]
+    assert _split(_latent(13, h=32, w=32, b=2), 1, 0, "auto", model)[0][0]["samples"].shape[2] == 2  # batch halves the chunk
 
 def test_merge_crossfade_and_reassembly():
     latent = _latent(13)

@@ -7,6 +7,7 @@ handles string annotations from 'from __future__ import annotations'.
 """
 
 import pytest
+import sys
 import time
 import subprocess
 import torch
@@ -23,7 +24,7 @@ class TestPublicAPI:
     def _server(self, args_pytest):
         """Start ComfyUI server for testing."""
         pargs = [
-            'python', 'main.py',
+            sys.executable, 'main.py',
             '--output-directory', args_pytest["output_dir"],
             '--listen', args_pytest["listen"],
             '--port', str(args_pytest["port"]),

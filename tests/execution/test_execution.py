@@ -3,6 +3,7 @@ import numpy
 from PIL import Image
 import pytest
 from pytest import fixture
+import sys
 import time
 import torch
 from typing import Union, Dict
@@ -190,7 +191,7 @@ class TestExecution:
     def server(self, args_pytest, request):
         # Start server
         pargs = [
-            'python','main.py',
+            sys.executable, 'main.py',
             '--output-directory', args_pytest["output_dir"],
             '--listen', args_pytest["listen"],
             '--port', str(args_pytest["port"]),

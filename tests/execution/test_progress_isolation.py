@@ -2,6 +2,7 @@
 
 import json
 import pytest
+import sys
 import time
 import threading
 import uuid
@@ -88,7 +89,7 @@ class TestProgressIsolation:
         """Start the ComfyUI server for testing."""
         import subprocess
         pargs = [
-            'python', 'main.py',
+            sys.executable, 'main.py',
             '--output-directory', args_pytest["output_dir"],
             '--listen', args_pytest["listen"],
             '--port', str(args_pytest["port"]),

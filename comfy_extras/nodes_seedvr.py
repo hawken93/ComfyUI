@@ -453,7 +453,7 @@ class SeedVR2TemporalChunk(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent, model, temporal_overlap, chunking_mode) -> io.NodeOutput:
+    def execute(cls, latent, temporal_overlap, chunking_mode, model=None) -> io.NodeOutput:
         samples = latent["samples"]
         if samples.ndim != 5:
             raise ValueError(
@@ -479,6 +479,8 @@ class SeedVR2TemporalChunk(io.ComfyNode):
         t_pixel = 4 * (t_latent - 1) + 1
 
         if mode == "auto":
+            if model is None:
+                raise ValueError("SeedVR2TemporalChunk auto mode requires a model to budget against free VRAM")
             free_gb = comfy.model_management.get_free_memory(model.load_device) / (1024 ** 3)
             mpx_per_frame = (samples.shape[0] * samples.shape[3] * samples.shape[4]) * (BYTEDANCE_VAE_SPATIAL_DOWNSAMPLE ** 2) / 1e6
             budget_gb = free_gb - SEEDVR2_CHUNK_RESERVED_GIB - SEEDVR2_CHUNK_SIGMA_K * SEEDVR2_CHUNK_SIGMA_GIB
