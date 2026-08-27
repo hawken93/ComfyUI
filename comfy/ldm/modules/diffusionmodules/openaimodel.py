@@ -403,6 +403,7 @@ class UNetModel(nn.Module):
 
     def __init__(
         self,
+        device,
         image_size,
         in_channels,
         model_channels,
@@ -445,7 +446,6 @@ class UNetModel(nn.Module):
         max_ddpm_temb_period=10000,
         attn_precision=None,
         heatmap_head=False,
-        device=None,
         operations=ops,
     ):
         super().__init__()

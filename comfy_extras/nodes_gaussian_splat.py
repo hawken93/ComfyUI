@@ -666,14 +666,14 @@ def _gauss_blur(x, sigma, dev):
     return x
 
 
-def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, bg, camera_info,
+def _render_gaussian(device, xyz, rgb, opacity, scale, rot, width, height, splat_scale, bg, camera_info,
                      sharpen=1.0, headlight_shading=0.0, render_style="color"):
     # Perspective-correct anisotropic gaussian splat rasterizer. Each splat is weighted by its 3D Gaussian's
     # peak along each pixel's ray (AAA / Hahlbohm), composited front-to-back across depth slabs. `render_style`
     # selects the image: color / clay / depth / normal. Returns (image HxWx3, coverage mask HxW) on CPU.
-    dev = comfy.model_management.get_torch_device()
-    t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=dev)
-    idev, idtype = comfy.model_management.intermediate_device(), comfy.model_management.intermediate_dtype()
+    t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
+    idev = comfy.model_management.intermediate_device(device)
+    idtype = comfy.model_management.intermediate_dtype()
     xyz, rgb, opacity = t(xyz), t(rgb).clamp(0, 1), t(opacity).reshape(-1)
     scale, rot = t(scale) * float(splat_scale), t(rot)
     do_linear = render_style == "color"  # colour blends in linear light, re-encoded at the end
@@ -686,13 +686,13 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     need_normal = render_style in ("normal", "clay") or headlight_shading > 0
 
     def background_only():  # no splats to rasterize -> just the background + empty mask
-        img = bg_t.expand(height, width, 3) if render_style == "color" else torch.zeros(height, width, 3, device=dev)
+        img = bg_t.expand(height, width, 3) if render_style == "color" else torch.zeros(height, width, 3, device=device)
         return img.to(idev, idtype), torch.zeros(height, width, device=idev, dtype=idtype)
 
     if xyz.shape[0] == 0:  # empty input (e.g. all culled by opacity_threshold)
         return background_only()
 
-    eye, target, right, up, fwd = _camera_basis(camera_info, dev)  # all camera state comes from camera_info
+    eye, target, right, up, fwd = _camera_basis(camera_info, device)  # all camera state comes from camera_info
     W = torch.stack([right, up, fwd], 0)                           # rows = camera axes (world -> camera)
     cam = (xyz - eye) @ W.T
     fov = float(camera_info.get("fov", 0) or 0) or 35.0
@@ -714,7 +714,7 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     # regularizer for a stable inverse (a pixel-size Mip low-pass would over-thicken flat surfels and blur).
     Mw = W[None] @ _quat_to_mat(rot)  # (N,3,3) world -> camera
     cam_cov = (Mw * scale.square()[:, None, :]) @ Mw.transpose(1, 2)
-    cam_cov = cam_cov + (cam_cov.diagonal(dim1=-2, dim2=-1).mean(-1) * 1e-3)[:, None, None] * torch.eye(3, device=dev)
+    cam_cov = cam_cov + (cam_cov.diagonal(dim1=-2, dim2=-1).mean(-1) * 1e-3)[:, None, None] * torch.eye(3, device=device)
 
     # Perspective-correct weighting: peak of the 3D Gaussian along each pixel ray. Precompute Si, Si@mu, mu^T Si mu.
     mu = torch.stack([xc, yc, zc], -1)
@@ -725,12 +725,12 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     s11, s12, s22 = si[:, 1, 1], si[:, 1, 2], si[:, 2, 2]
     simu0, simu1, simu2 = simu.unbind(-1)
     if need_normal:  # surfel normal = thinnest axis, oriented toward camera
-        nrm = Mw[torch.arange(Mw.shape[0], device=dev), :, scale.argmin(-1)]  # (N,3) camera-space normal
+        nrm = Mw[torch.arange(Mw.shape[0], device=device), :, scale.argmin(-1)]  # (N,3) camera-space normal
         nrm = nrm * torch.where(nrm[:, 2:3] > 0, -1.0, 1.0)                   # flip so nz <= 0 (faces camera)
 
     # Screen centre (exact) + footprint radius from the affine 2D projection (used only to size the kernel).
     # The image is +y-down, so the projection's y row is unflipped - it matches the splat frame's +Y.
-    jm = torch.zeros(xc.shape[0], 2, 3, device=dev)
+    jm = torch.zeros(xc.shape[0], 2, 3, device=device)
     if is_ortho:                                              # parallel projection: screen = s * (xc, yc)
         s = f / float((target - eye).norm().clamp_min(1e-6))  # pixels per world unit at the target plane
         cx, cy = cx0 + s * xc, cy0 + s * yc
@@ -750,10 +750,10 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     # Per-splat kernel size: bucket splats by radius into a coarse ladder of window sizes (global K stays the cap) so
     # small splats (the bulk of it) use a small window.
     levels = [L for L in (16, 64, 256) if L < K] + [K]
-    levels_t = torch.tensor(levels, device=dev, dtype=torch.float32)
+    levels_t = torch.tensor(levels, device=device, dtype=torch.float32)
     grids = []
     for L in levels:
-        rng = torch.arange(-L, L + 1, device=dev, dtype=torch.float32)
+        rng = torch.arange(-L, L + 1, device=device, dtype=torch.float32)
         gy, gx = torch.meshgrid(rng, rng, indexing="ij")
         grids.append((gx.reshape(-1), gy.reshape(-1)))
     blevel = torch.bucketize(radius * (4.0 / 3.0), levels_t).clamp_(max=len(levels) - 1)  # window >= ~4 sigma
@@ -762,9 +762,9 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     ns = int(min(256, max(1, n // 1000)))                      # depth slabs: 1 per ~1000 splats, capped
     nl = len(levels)
     order = torch.argsort(zc)                                  # front (small zc) -> back -> defines the slabs
-    bounds = torch.linspace(0, n, ns + 1, device=dev).round().long()
-    rank = torch.empty(n, dtype=torch.long, device=dev)
-    rank[order] = torch.arange(n, device=dev)                  # depth rank of each splat
+    bounds = torch.linspace(0, n, ns + 1, device=device).round().long()
+    rank = torch.empty(n, dtype=torch.long, device=device)
+    rank[order] = torch.arange(n, device=device)                  # depth rank of each splat
     slab_id = (torch.searchsorted(bounds, rank, right=True) - 1).clamp_(0, ns - 1)
     key = slab_id * nl + blevel                                # group by slab, then kernel level (order-free within)
     order = torch.argsort(key)
@@ -785,7 +785,7 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     pstack = torch.stack(common + ([s02, s12, mux_o, muy_o, muz_o] if is_ortho else [simu0, simu1, simu2, musimu]))
 
     # Precompute the (slab, level) run table on-GPU and pull it to the CPU once
-    starts = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), (key[1:] != key[:-1]).nonzero().flatten() + 1])
+    starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), (key[1:] != key[:-1]).nonzero().flatten() + 1])
     ks = key[starts]
     run_lo = starts.tolist() + [n]
     run_lev = (ks % nl).tolist()
@@ -825,16 +825,16 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
     # Front-to-back compositing over the depth slabs set up above. Within a slab the accumulation is a pure
     # sum (order-independent), so splats are grouped by kernel level and each level uses its own tight window.
     sharp = sharpen != 1.0  # winner-take-more colour blend: dominant splat shows more
-    cacc = torch.zeros((flat, 3), device=dev)
-    trans = torch.ones((flat,), device=dev)
-    a_buf = torch.zeros((flat,), device=dev)                            # sum alpha -> colour/depth/normal weight (alpha-weighted mean)
-    tau_buf = torch.zeros((flat,), device=dev)                          # sum -ln(1-alpha) -> slab opacity = 1-prod(1-alpha)
-    crgb = torch.zeros((flat, 3), device=dev)                           # sum alpha^p * rgb -> slab colour
-    wbuf = torch.zeros((flat,), device=dev) if sharp else None          # sum alpha^p -> colour normalizer (sharp only)
-    dacc = torch.zeros((flat,), device=dev) if need_depth else None     # front-weighted depth
-    nacc = torch.zeros((flat, 3), device=dev) if need_normal else None  # front-weighted camera-space normal
-    zslab = torch.zeros((flat,), device=dev) if need_depth else None
-    nslab = torch.zeros((flat, 3), device=dev) if need_normal else None
+    cacc = torch.zeros((flat, 3), device=device)
+    trans = torch.ones((flat,), device=device)
+    a_buf = torch.zeros((flat,), device=device)                            # sum alpha -> colour/depth/normal weight (alpha-weighted mean)
+    tau_buf = torch.zeros((flat,), device=device)                          # sum -ln(1-alpha) -> slab opacity = 1-prod(1-alpha)
+    crgb = torch.zeros((flat, 3), device=device)                           # sum alpha^p * rgb -> slab colour
+    wbuf = torch.zeros((flat,), device=device) if sharp else None          # sum alpha^p -> colour normalizer (sharp only)
+    dacc = torch.zeros((flat,), device=device) if need_depth else None     # front-weighted depth
+    nacc = torch.zeros((flat, 3), device=device) if need_normal else None  # front-weighted camera-space normal
+    zslab = torch.zeros((flat,), device=device) if need_depth else None
+    nslab = torch.zeros((flat, 3), device=device) if need_normal else None
     stale = 0  # consecutive fully-occluded slabs -> early-out
     for si in range(ns):
         runs = slab_runs[si]
@@ -894,12 +894,12 @@ def _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, 
         # Per-splat surfel normals are jittery, so do a masked blur
         nb = nacc.reshape(height, width, 3).permute(2, 0, 1)[None]
         cb = cov.reshape(1, 1, height, width)
-        nb, cb = _gauss_blur(nb, 1.2, dev), _gauss_blur(cb, 1.2, dev)
+        nb, cb = _gauss_blur(nb, 1.2, device), _gauss_blur(cb, 1.2, device)
         normal = (nb / cb.clamp_min(1e-6))[0].permute(1, 2, 0)
         nrm_map = normal / normal.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
     if render_style == "depth":  # near = bright, far = dark, 0 off-object
-        d = torch.zeros(height, width, device=dev)
+        d = torch.zeros(height, width, device=device)
         if bool(covm.any()):
             lo, hi = depth_map[covm].min(), depth_map[covm].max()
             d = torch.where(covm, ((hi - depth_map) / (hi - lo).clamp_min(1e-6)).clamp(0, 1), d)
@@ -983,7 +983,7 @@ class RenderSplat(IO.ComfyNode):
         n_frames = abs(int(frames)) or 1         # magnitude = frame count (0 -> single still)
         orbit_dir = -1.0 if frames < 0 else 1.0  # sign = orbit direction
         imgs, masks = [], []
-        device = comfy.model_management.get_torch_device()
+        device = splat.positions.device
         total = splat.positions.shape[0] * n_frames
         pbar = comfy.utils.ProgressBar(total) if total > 1 else None
         k = 0
@@ -1003,7 +1003,7 @@ class RenderSplat(IO.ComfyNode):
                 cam_fr = (base_cam if n_frames == 1
                           else _orbit_camera_info_yaw(base_cam, orbit_dir * 360.0 * fr / n_frames, device))
                 bg_k = bg_imgs[k % bg_imgs.shape[0]] if bg_imgs is not None else bg   # per-frame plate, or solid colour
-                img, mask = _render_gaussian(xyz, rgb, opacity, scale, rot, width, height, splat_scale, bg_k, cam_fr,
+                img, mask = _render_gaussian(device, xyz, rgb, opacity, scale, rot, width, height, splat_scale, bg_k, cam_fr,
                                              sharpen=sharpen, headlight_shading=headlight_shading,
                                              render_style=render_style)
                 imgs.append(img)
@@ -1070,7 +1070,7 @@ class CreateCameraInfo(IO.ComfyNode):  # TODO: move to better file
 
     @classmethod
     def execute(cls, mode, target_x, target_y, target_z, roll, fov, zoom=1.0, camera_type="perspective") -> IO.NodeOutput:
-        dev = comfy.model_management.get_torch_device()
+        dev = comfy.model_management.pick_device_for_option("default")
         kind = mode["mode"]
         if kind == "quaternion":  # explicit world position + camera rotation
             position = [mode["position_x"], mode["position_y"], mode["position_z"]]
@@ -1640,7 +1640,7 @@ class SplatToMesh(IO.ComfyNode):
 
     @classmethod
     def execute(cls, splat, resolution, kernel, smooth, level, min_component, min_opacity, color_sharpen) -> IO.NodeOutput:
-        device = comfy.model_management.get_torch_device()
+        device = splat.positions.device
         b = splat.positions.shape[0]
         prec = 1000  # each splat owns a 0..prec block of the bar; its callback advances within that block
         pbar = comfy.utils.ProgressBar(b * prec)

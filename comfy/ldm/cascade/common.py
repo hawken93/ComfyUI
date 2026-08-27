@@ -18,13 +18,14 @@
 
 import torch
 import torch.nn as nn
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.ops
 
 class OptimizedAttention(nn.Module):
-    def __init__(self, c, nhead, dropout=0.0, dtype=None, device=None, operations=None):
+    def __init__(self, c, nhead, device, dropout=0.0, dtype=None, operations=None):
         super().__init__()
         self.heads = nhead
+        self.optimized_attention = optimized_attention_for_device(device)
 
         self.to_q = operations.Linear(c, c, bias=True, dtype=dtype, device=device)
         self.to_k = operations.Linear(c, c, bias=True, dtype=dtype, device=device)
@@ -37,14 +38,14 @@ class OptimizedAttention(nn.Module):
         k = self.to_k(k)
         v = self.to_v(v)
 
-        out = optimized_attention(q, k, v, self.heads, transformer_options=transformer_options)
+        out = self.optimized_attention(q, k, v, self.heads, transformer_options=transformer_options)
 
         return self.out_proj(out)
 
 class Attention2D(nn.Module):
-    def __init__(self, c, nhead, dropout=0.0, dtype=None, device=None, operations=None):
+    def __init__(self, c, nhead, device, dropout=0.0, dtype=None, operations=None):
         super().__init__()
-        self.attn = OptimizedAttention(c, nhead, dtype=dtype, device=device, operations=operations)
+        self.attn = OptimizedAttention(c, nhead, device, dtype=dtype, operations=operations)
         # self.attn = nn.MultiheadAttention(c, nhead, dropout=dropout, bias=True, batch_first=True, dtype=dtype, device=device)
 
     def forward(self, x, kv, self_attn=False, transformer_options={}):
@@ -69,7 +70,7 @@ def LayerNorm2d_op(operations):
 
 class GlobalResponseNorm(nn.Module):
     "from https://github.com/facebookresearch/ConvNeXt-V2/blob/3608f67cc1dae164790c5d0aead7bf2d73d9719b/models/utils.py#L105"
-    def __init__(self, dim, dtype=None, device=None):
+    def __init__(self, dim, device, dtype=None):
         super().__init__()
         self.gamma = nn.Parameter(torch.empty(1, 1, 1, dim, dtype=dtype, device=device))
         self.beta = nn.Parameter(torch.empty(1, 1, 1, dim, dtype=dtype, device=device))
@@ -81,7 +82,7 @@ class GlobalResponseNorm(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, c, c_skip=0, kernel_size=3, dropout=0.0, dtype=None, device=None, operations=None):  # , num_heads=4, expansion=2):
+    def __init__(self, c, device, c_skip=0, kernel_size=3, dropout=0.0, dtype=None, operations=None):  # , num_heads=4, expansion=2):
         super().__init__()
         self.depthwise = operations.Conv2d(c, c, kernel_size=kernel_size, padding=kernel_size // 2, groups=c, dtype=dtype, device=device)
         #         self.depthwise = SAMBlock(c, num_heads, expansion)
@@ -104,11 +105,11 @@ class ResBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, c, c_cond, nhead, self_attn=True, dropout=0.0, dtype=None, device=None, operations=None):
+    def __init__(self, c, c_cond, nhead, device, self_attn=True, dropout=0.0, dtype=None, operations=None):
         super().__init__()
         self.self_attn = self_attn
         self.norm = LayerNorm2d_op(operations)(c, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
-        self.attention = Attention2D(c, nhead, dropout, dtype=dtype, device=device, operations=operations)
+        self.attention = Attention2D(c, nhead, device, dropout=dropout, dtype=dtype, operations=operations)
         self.kv_mapper = nn.Sequential(
             nn.SiLU(),
             operations.Linear(c_cond, c, dtype=dtype, device=device)
@@ -121,7 +122,7 @@ class AttnBlock(nn.Module):
 
 
 class FeedForwardBlock(nn.Module):
-    def __init__(self, c, dropout=0.0, dtype=None, device=None, operations=None):
+    def __init__(self, c, device, dropout=0.0, dtype=None, operations=None):
         super().__init__()
         self.norm = LayerNorm2d_op(operations)(c, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.channelwise = nn.Sequential(
@@ -138,7 +139,7 @@ class FeedForwardBlock(nn.Module):
 
 
 class TimestepBlock(nn.Module):
-    def __init__(self, c, c_timestep, conds=['sca'], dtype=None, device=None, operations=None):
+    def __init__(self, c, c_timestep, device, conds=['sca'], dtype=None, operations=None):
         super().__init__()
         self.mapper = operations.Linear(c_timestep, c * 2, dtype=dtype, device=device)
         self.conds = conds

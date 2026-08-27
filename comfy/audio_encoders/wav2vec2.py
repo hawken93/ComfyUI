@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 class LayerNormConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, bias=False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels, out_channels, kernel_size, stride, bias=False, dtype=None):
         super().__init__()
         self.conv = operations.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, bias=bias, device=device, dtype=dtype)
         self.layer_norm = operations.LayerNorm(out_channels, elementwise_affine=True, device=device, dtype=dtype)
@@ -14,7 +14,7 @@ class LayerNormConv(nn.Module):
         return torch.nn.functional.gelu(self.layer_norm(x.transpose(-2, -1)).transpose(-2, -1))
 
 class LayerGroupNormConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, bias=False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels, out_channels, kernel_size, stride, bias=False, dtype=None):
         super().__init__()
         self.conv = operations.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, bias=bias, device=device, dtype=dtype)
         self.layer_norm = operations.GroupNorm(num_groups=out_channels, num_channels=out_channels, affine=True, device=device, dtype=dtype)
@@ -24,7 +24,7 @@ class LayerGroupNormConv(nn.Module):
         return torch.nn.functional.gelu(self.layer_norm(x))
 
 class ConvNoNorm(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, bias=False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_channels, out_channels, kernel_size, stride, bias=False, dtype=None):
         super().__init__()
         self.conv = operations.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, bias=bias, device=device, dtype=dtype)
 
@@ -34,27 +34,27 @@ class ConvNoNorm(nn.Module):
 
 
 class ConvFeatureEncoder(nn.Module):
-    def __init__(self, conv_dim, conv_bias=False, conv_norm=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, conv_dim, conv_bias=False, conv_norm=True, dtype=None):
         super().__init__()
         if conv_norm:
             self.conv_layers = nn.ModuleList([
-                LayerNormConv(1, conv_dim, kernel_size=10, stride=5, bias=True, device=device, dtype=dtype, operations=operations),
-                LayerNormConv(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                LayerNormConv(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                LayerNormConv(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                LayerNormConv(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                LayerNormConv(conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                LayerNormConv(conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
+                LayerNormConv(device, operations, 1, conv_dim, kernel_size=10, stride=5, bias=True, dtype=dtype),
+                LayerNormConv(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                LayerNormConv(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                LayerNormConv(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                LayerNormConv(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                LayerNormConv(device, operations, conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, dtype=dtype),
+                LayerNormConv(device, operations, conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, dtype=dtype),
             ])
         else:
             self.conv_layers = nn.ModuleList([
-                LayerGroupNormConv(1, conv_dim, kernel_size=10, stride=5, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                ConvNoNorm(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                ConvNoNorm(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                ConvNoNorm(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                ConvNoNorm(conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                ConvNoNorm(conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
-                ConvNoNorm(conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, device=device, dtype=dtype, operations=operations),
+                LayerGroupNormConv(device, operations, 1, conv_dim, kernel_size=10, stride=5, bias=conv_bias, dtype=dtype),
+                ConvNoNorm(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                ConvNoNorm(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                ConvNoNorm(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                ConvNoNorm(device, operations, conv_dim, conv_dim, kernel_size=3, stride=2, bias=conv_bias, dtype=dtype),
+                ConvNoNorm(device, operations, conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, dtype=dtype),
+                ConvNoNorm(device, operations, conv_dim, conv_dim, kernel_size=2, stride=2, bias=conv_bias, dtype=dtype),
             ])
 
     def forward(self, x):
@@ -67,7 +67,7 @@ class ConvFeatureEncoder(nn.Module):
 
 
 class FeatureProjection(nn.Module):
-    def __init__(self, conv_dim, embed_dim, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, conv_dim, embed_dim, dtype=None):
         super().__init__()
         self.layer_norm = operations.LayerNorm(conv_dim, eps=1e-05, device=device, dtype=dtype)
         self.projection = operations.Linear(conv_dim, embed_dim, device=device, dtype=dtype)
@@ -79,7 +79,7 @@ class FeatureProjection(nn.Module):
 
 
 class PositionalConvEmbedding(nn.Module):
-    def __init__(self, embed_dim=768, kernel_size=128, groups=16):
+    def __init__(self, device, embed_dim=768, kernel_size=128, groups=16, dtype=None):
         super().__init__()
         self.conv = nn.Conv1d(
             embed_dim,
@@ -87,6 +87,7 @@ class PositionalConvEmbedding(nn.Module):
             kernel_size=kernel_size,
             padding=kernel_size // 2,
             groups=groups,
+            device=device, dtype=dtype,
         )
         self.conv = torch.nn.utils.parametrizations.weight_norm(self.conv, name="weight", dim=2)
         self.activation = nn.GELU()
@@ -102,23 +103,25 @@ class PositionalConvEmbedding(nn.Module):
 class TransformerEncoder(nn.Module):
     def __init__(
         self,
+        device, operations,
         embed_dim=768,
         num_heads=12,
         num_layers=12,
         mlp_ratio=4.0,
         do_stable_layer_norm=True,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
 
-        self.pos_conv_embed = PositionalConvEmbedding(embed_dim=embed_dim)
+        self.pos_conv_embed = PositionalConvEmbedding(device, embed_dim=embed_dim, dtype=dtype)
         self.layers = nn.ModuleList([
             TransformerEncoderLayer(
+                device, operations,
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 do_stable_layer_norm=do_stable_layer_norm,
-                device=device, dtype=dtype, operations=operations
+                dtype=dtype
             )
             for _ in range(num_layers)
         ])
@@ -141,11 +144,12 @@ class TransformerEncoder(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, embed_dim, num_heads, bias=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, embed_dim, num_heads, bias=True, dtype=None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.optimized_attention = optimized_attention_for_device(device)
 
         self.k_proj = operations.Linear(embed_dim, embed_dim, bias=bias, device=device, dtype=dtype)
         self.v_proj = operations.Linear(embed_dim, embed_dim, bias=bias, device=device, dtype=dtype)
@@ -158,12 +162,12 @@ class Attention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        out = optimized_attention_masked(q, k, v, self.num_heads)
+        out = self.optimized_attention(q, k, v, self.num_heads)
         return self.out_proj(out)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, embed_dim, mlp_ratio, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, embed_dim, mlp_ratio, dtype=None):
         super().__init__()
         self.intermediate_dense = operations.Linear(embed_dim, int(embed_dim * mlp_ratio), device=device, dtype=dtype)
         self.output_dense = operations.Linear(int(embed_dim * mlp_ratio), embed_dim, device=device, dtype=dtype)
@@ -178,18 +182,19 @@ class FeedForward(nn.Module):
 class TransformerEncoderLayer(nn.Module):
     def __init__(
         self,
+        device, operations,
         embed_dim=768,
         num_heads=12,
         mlp_ratio=4.0,
         do_stable_layer_norm=True,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
 
-        self.attention = Attention(embed_dim, num_heads, device=device, dtype=dtype, operations=operations)
+        self.attention = Attention(device, operations, embed_dim, num_heads, dtype=dtype)
 
         self.layer_norm = operations.LayerNorm(embed_dim, device=device, dtype=dtype)
-        self.feed_forward = FeedForward(embed_dim, mlp_ratio, device=device, dtype=dtype, operations=operations)
+        self.feed_forward = FeedForward(device, operations, embed_dim, mlp_ratio, dtype=dtype)
         self.final_layer_norm = operations.LayerNorm(embed_dim, device=device, dtype=dtype)
         self.do_stable_layer_norm = do_stable_layer_norm
 
@@ -211,6 +216,7 @@ class Wav2Vec2Model(nn.Module):
 
     def __init__(
         self,
+        device, operations,
         embed_dim=1024,
         final_dim=256,
         num_heads=16,
@@ -219,23 +225,24 @@ class Wav2Vec2Model(nn.Module):
         conv_bias=True,
         do_normalize=True,
         do_stable_layer_norm=True,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
         super().__init__()
 
         conv_dim = 512
-        self.feature_extractor = ConvFeatureEncoder(conv_dim, conv_norm=conv_norm, conv_bias=conv_bias, device=device, dtype=dtype, operations=operations)
-        self.feature_projection = FeatureProjection(conv_dim, embed_dim, device=device, dtype=dtype, operations=operations)
+        self.feature_extractor = ConvFeatureEncoder(device, operations, conv_dim, conv_norm=conv_norm, conv_bias=conv_bias, dtype=dtype)
+        self.feature_projection = FeatureProjection(device, operations, conv_dim, embed_dim, dtype=dtype)
 
         self.masked_spec_embed = nn.Parameter(torch.empty(embed_dim, device=device, dtype=dtype))
         self.do_normalize = do_normalize
 
         self.encoder = TransformerEncoder(
+            device, operations,
             embed_dim=embed_dim,
             num_heads=num_heads,
             num_layers=num_layers,
             do_stable_layer_norm=do_stable_layer_norm,
-            device=device, dtype=dtype, operations=operations
+            dtype=dtype
         )
 
     def forward(self, x, mask_time_indices=None, return_dict=False):

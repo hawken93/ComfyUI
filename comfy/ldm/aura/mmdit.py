@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.ops
 import comfy.patcher_extension
 import comfy.ldm.common_dit
@@ -23,7 +23,7 @@ def find_multiple(n: int, k: int) -> int:
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim=None, dtype=None, device=None, operations=None) -> None:
+    def __init__(self, dim, device, hidden_dim=None, dtype=None, operations=None) -> None:
         super().__init__()
         if hidden_dim is None:
             hidden_dim = 4 * dim
@@ -42,7 +42,7 @@ class MLP(nn.Module):
 
 
 class MultiHeadLayerNorm(nn.Module):
-    def __init__(self, hidden_size=None, eps=1e-5, dtype=None, device=None):
+    def __init__(self, device, hidden_size=None, eps=1e-5, dtype=None):
         # Copy pasta from https://github.com/huggingface/transformers/blob/e5f71ecaae50ea476d1e12351003790273c4b2ed/src/transformers/models/cohere/modeling_cohere.py#L78
 
         super().__init__()
@@ -61,7 +61,7 @@ class MultiHeadLayerNorm(nn.Module):
         return hidden_states.to(input_dtype)
 
 class SingleAttention(nn.Module):
-    def __init__(self, dim, n_heads, mh_qknorm=False, dtype=None, device=None, operations=None):
+    def __init__(self, dim, n_heads, device, mh_qknorm=False, dtype=None, operations=None):
         super().__init__()
 
         self.n_heads = n_heads
@@ -74,15 +74,17 @@ class SingleAttention(nn.Module):
         self.w1o = operations.Linear(dim, dim, bias=False, dtype=dtype, device=device)
 
         self.q_norm1 = (
-            MultiHeadLayerNorm((self.n_heads, self.head_dim), dtype=dtype, device=device)
+            MultiHeadLayerNorm(device, (self.n_heads, self.head_dim), dtype=dtype)
             if mh_qknorm
             else operations.LayerNorm(self.head_dim, elementwise_affine=False, dtype=dtype, device=device)
         )
         self.k_norm1 = (
-            MultiHeadLayerNorm((self.n_heads, self.head_dim), dtype=dtype, device=device)
+            MultiHeadLayerNorm(device, (self.n_heads, self.head_dim), dtype=dtype)
             if mh_qknorm
             else operations.LayerNorm(self.head_dim, elementwise_affine=False, dtype=dtype, device=device)
         )
+
+        self.optimized_attention = optimized_attention_for_device(device)
 
     #@torch.compile()
     def forward(self, c, transformer_options={}):
@@ -95,14 +97,14 @@ class SingleAttention(nn.Module):
         v = v.view(bsz, seqlen1, self.n_heads, self.head_dim)
         q, k = self.q_norm1(q), self.k_norm1(k)
 
-        output = optimized_attention(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3), self.n_heads, skip_reshape=True, transformer_options=transformer_options)
+        output = self.optimized_attention(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3), self.n_heads, skip_reshape=True, transformer_options=transformer_options)
         c = self.w1o(output)
         return c
 
 
 
 class DoubleAttention(nn.Module):
-    def __init__(self, dim, n_heads, mh_qknorm=False, dtype=None, device=None, operations=None):
+    def __init__(self, dim, n_heads, device, mh_qknorm=False, dtype=None, operations=None):
         super().__init__()
 
         self.n_heads = n_heads
@@ -121,26 +123,28 @@ class DoubleAttention(nn.Module):
         self.w2o = operations.Linear(dim, dim, bias=False, dtype=dtype, device=device)
 
         self.q_norm1 = (
-            MultiHeadLayerNorm((self.n_heads, self.head_dim), dtype=dtype, device=device)
+            MultiHeadLayerNorm(device, (self.n_heads, self.head_dim), dtype=dtype)
             if mh_qknorm
             else operations.LayerNorm(self.head_dim, elementwise_affine=False, dtype=dtype, device=device)
         )
         self.k_norm1 = (
-            MultiHeadLayerNorm((self.n_heads, self.head_dim), dtype=dtype, device=device)
+            MultiHeadLayerNorm(device, (self.n_heads, self.head_dim), dtype=dtype)
             if mh_qknorm
             else operations.LayerNorm(self.head_dim, elementwise_affine=False, dtype=dtype, device=device)
         )
 
         self.q_norm2 = (
-            MultiHeadLayerNorm((self.n_heads, self.head_dim), dtype=dtype, device=device)
+            MultiHeadLayerNorm(device, (self.n_heads, self.head_dim), dtype=dtype)
             if mh_qknorm
             else operations.LayerNorm(self.head_dim, elementwise_affine=False, dtype=dtype, device=device)
         )
         self.k_norm2 = (
-            MultiHeadLayerNorm((self.n_heads, self.head_dim), dtype=dtype, device=device)
+            MultiHeadLayerNorm(device, (self.n_heads, self.head_dim), dtype=dtype)
             if mh_qknorm
             else operations.LayerNorm(self.head_dim, elementwise_affine=False, dtype=dtype, device=device)
         )
+
+        self.optimized_attention = optimized_attention_for_device(device)
 
 
     #@torch.compile()
@@ -168,7 +172,7 @@ class DoubleAttention(nn.Module):
             torch.cat([cv, xv], dim=1),
         )
 
-        output = optimized_attention(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3), self.n_heads, skip_reshape=True, transformer_options=transformer_options)
+        output = self.optimized_attention(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3), self.n_heads, skip_reshape=True, transformer_options=transformer_options)
 
         c, x = output.split([seqlen1, seqlen2], dim=1)
         c = self.w1o(c)
@@ -178,7 +182,7 @@ class DoubleAttention(nn.Module):
 
 
 class MMDiTBlock(nn.Module):
-    def __init__(self, dim, heads=8, global_conddim=1024, is_last=False, dtype=None, device=None, operations=None):
+    def __init__(self, dim, device, heads=8, global_conddim=1024, is_last=False, dtype=None, operations=None):
         super().__init__()
 
         self.normC1 = operations.LayerNorm(dim, elementwise_affine=False, dtype=dtype, device=device)
@@ -203,7 +207,7 @@ class MMDiTBlock(nn.Module):
             operations.Linear(global_conddim, 6 * dim, bias=False, dtype=dtype, device=device),
         )
 
-        self.attn = DoubleAttention(dim, heads, dtype=dtype, device=device, operations=operations)
+        self.attn = DoubleAttention(dim, device, heads, dtype=dtype, operations=operations)
         self.is_last = is_last
 
     #@torch.compile()
@@ -240,7 +244,7 @@ class MMDiTBlock(nn.Module):
 
 class DiTBlock(nn.Module):
     # like MMDiTBlock, but it only has X
-    def __init__(self, dim, heads=8, global_conddim=1024, dtype=None, device=None, operations=None):
+    def __init__(self, dim, device, heads=8, global_conddim=1024, dtype=None, operations=None):
         super().__init__()
 
         self.norm1 = operations.LayerNorm(dim, elementwise_affine=False, dtype=dtype, device=device)
@@ -251,7 +255,7 @@ class DiTBlock(nn.Module):
             operations.Linear(global_conddim, 6 * dim, bias=False, dtype=dtype, device=device),
         )
 
-        self.attn = SingleAttention(dim, heads, dtype=dtype, device=device, operations=operations)
+        self.attn = SingleAttention(dim, device, heads, dtype=dtype, operations=operations)
         self.mlp = MLP(dim, hidden_dim=dim * 4, dtype=dtype, device=device, operations=operations)
 
     #@torch.compile()
@@ -273,7 +277,7 @@ class DiTBlock(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=None, device=None, operations=None):
+    def __init__(self, hidden_size, device, frequency_embedding_size=256, dtype=None, operations=None):
         super().__init__()
         self.mlp = nn.Sequential(
             operations.Linear(frequency_embedding_size, hidden_size, dtype=dtype, device=device),
@@ -306,6 +310,7 @@ class TimestepEmbedder(nn.Module):
 class MMDiT(nn.Module):
     def __init__(
         self,
+        device,
         in_channels=4,
         out_channels=4,
         patch_size=2,
@@ -316,7 +321,6 @@ class MMDiT(nn.Module):
         global_conddim=3072,
         cond_seq_dim=2048,
         max_seq=32 * 32,
-        device=None,
         dtype=None,
         operations=None,
     ):
@@ -341,12 +345,12 @@ class MMDiT(nn.Module):
 
         for idx in range(n_double_layers):
             self.double_layers.append(
-                MMDiTBlock(dim, n_heads, global_conddim, is_last=(idx == n_layers - 1), dtype=dtype, device=device, operations=operations)
+                MMDiTBlock(dim, device, n_heads, global_conddim, is_last=(idx == n_layers - 1), dtype=dtype, operations=operations)
             )
 
         for idx in range(n_double_layers, n_layers):
             self.single_layers.append(
-                DiTBlock(dim, n_heads, global_conddim, dtype=dtype, device=device, operations=operations)
+                DiTBlock(dim, device, n_heads, global_conddim, dtype=dtype, operations=operations)
             )
 
 

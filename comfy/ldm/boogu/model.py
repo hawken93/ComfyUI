@@ -12,7 +12,7 @@ from einops import rearrange
 
 import comfy.ldm.common_dit
 import comfy.ldm.omnigen.omnigen2
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.omnigen.omnigen2 import (
     OmniGen2RotaryPosEmbed,
     Lumina2CombinedTimestepCaptionEmbedding,
@@ -26,7 +26,7 @@ from comfy.ldm.omnigen.omnigen2 import (
 
 class BooguDoubleStreamProcessor(nn.Module):
     # Joint attention over [instruct ; img] with separate per-stream q/k/v and output projections.
-    def __init__(self, dim, head_dim, heads, kv_heads, dtype=None, device=None, operations=None):
+    def __init__(self, dim, head_dim, heads, kv_heads, device, dtype=None, operations=None):
         super().__init__()
         query_dim = head_dim * heads
         kv_dim = head_dim * kv_heads
@@ -41,6 +41,8 @@ class BooguDoubleStreamProcessor(nn.Module):
 
         self.instruct_out = operations.Linear(query_dim, query_dim, bias=False, dtype=dtype, device=device)
         self.img_out = operations.Linear(query_dim, query_dim, bias=False, dtype=dtype, device=device)
+
+        self._attention_fn = optimized_attention_for_device(device)
 
     def forward(self, attn, img_hidden_states, instruct_hidden_states, rotary_emb, attention_mask=None, transformer_options={}):
         batch_size = img_hidden_states.shape[0]
@@ -75,7 +77,7 @@ class BooguDoubleStreamProcessor(nn.Module):
         value = value.transpose(1, 2)
 
         gqa_kwargs = {"enable_gqa": True} if attn.kv_heads < attn.heads else {}
-        hidden_states = optimized_attention_masked(query, key, value, attn.heads, attention_mask, skip_reshape=True, transformer_options=transformer_options, **gqa_kwargs)
+        hidden_states = self._attention_fn(query, key, value, attn.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options, **gqa_kwargs)
 
         # Split back to instruction/image, apply per-stream output projections, recombine.
         instruct_hidden_states = self.instruct_out(hidden_states[:, :L_instruct])
@@ -88,7 +90,7 @@ class BooguDoubleStreamProcessor(nn.Module):
 
 class BooguJointAttention(nn.Module):
     # Holds the shared q/k RMSNorm + final output projection
-    def __init__(self, dim, head_dim, heads, kv_heads, eps=1e-5, dtype=None, device=None, operations=None):
+    def __init__(self, dim, head_dim, heads, kv_heads, device, eps=1e-5, dtype=None, operations=None):
         super().__init__()
         self.heads = heads
         self.kv_heads = kv_heads
@@ -109,7 +111,7 @@ class BooguJointAttention(nn.Module):
 
 class BooguDoubleStreamBlock(nn.Module):
     # Dual-stream block: joint attention over [instruct ; img] + image self-attention, each stream with its own modulation/MLP.
-    def __init__(self, dim, num_attention_heads, num_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, dtype=None, device=None, operations=None):
+    def __init__(self, dim, num_attention_heads, num_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, device, dtype=None, operations=None):
         super().__init__()
         head_dim = dim // num_attention_heads
 
@@ -170,6 +172,7 @@ class BooguDoubleStreamBlock(nn.Module):
 class BooguTransformer2DModel(nn.Module):
     def __init__(
         self,
+        device,
         patch_size: int = 2,
         in_channels: int = 16,
         out_channels: Optional[int] = None,
@@ -187,7 +190,7 @@ class BooguTransformer2DModel(nn.Module):
         instruction_feat_dim: int = 4096,
         timestep_scale: float = 1000.0,
         image_model=None,
-        device=None, dtype=None, operations=None,
+        dtype=None, operations=None,
     ):
         super().__init__()
 

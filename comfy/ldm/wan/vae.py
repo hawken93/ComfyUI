@@ -186,7 +186,7 @@ class AttentionBlock(nn.Module):
     Causal self-attention with a single head.
     """
 
-    def __init__(self, dim):
+    def __init__(self, device, dim):
         super().__init__()
         self.dim = dim
 
@@ -194,7 +194,7 @@ class AttentionBlock(nn.Module):
         self.norm = RMS_norm(dim)
         self.to_qkv = ops.Conv2d(dim, dim * 3, 1)
         self.proj = ops.Conv2d(dim, dim, 1)
-        self.optimized_attention = vae_attention()
+        self.optimized_attention = vae_attention(device)
 
     def forward(self, x, feat_cache=None, feat_idx=[0], final=False):
         identity = x
@@ -215,6 +215,7 @@ class AttentionBlock(nn.Module):
 class Encoder3d(nn.Module):
 
     def __init__(self,
+                 device,
                  dim=128,
                  z_dim=4,
                  input_channels=3,
@@ -245,7 +246,7 @@ class Encoder3d(nn.Module):
             for _ in range(num_res_blocks):
                 downsamples.append(ResidualBlock(in_dim, out_dim, dropout))
                 if scale in attn_scales:
-                    downsamples.append(AttentionBlock(out_dim))
+                    downsamples.append(AttentionBlock(device, out_dim))
                 in_dim = out_dim
 
             # downsample block
@@ -258,7 +259,7 @@ class Encoder3d(nn.Module):
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(out_dim),
+            ResidualBlock(out_dim, out_dim, dropout), AttentionBlock(device, out_dim),
             ResidualBlock(out_dim, out_dim, dropout))
 
         # output blocks
@@ -308,6 +309,7 @@ class Encoder3d(nn.Module):
 class Decoder3d(nn.Module):
 
     def __init__(self,
+                 device,
                  dim=128,
                  z_dim=4,
                  output_channels=3,
@@ -333,7 +335,7 @@ class Decoder3d(nn.Module):
 
         # middle blocks
         self.middle = nn.Sequential(
-            ResidualBlock(dims[0], dims[0], dropout), AttentionBlock(dims[0]),
+            ResidualBlock(dims[0], dims[0], dropout), AttentionBlock(device, dims[0]),
             ResidualBlock(dims[0], dims[0], dropout))
 
         # upsample blocks
@@ -345,7 +347,7 @@ class Decoder3d(nn.Module):
             for _ in range(num_res_blocks + 1):
                 upsamples.append(ResidualBlock(in_dim, out_dim, dropout))
                 if scale in attn_scales:
-                    upsamples.append(AttentionBlock(out_dim))
+                    upsamples.append(AttentionBlock(device, out_dim))
                 in_dim = out_dim
 
             # upsample block
@@ -432,6 +434,7 @@ def count_cache_layers(model):
 class WanVAE(nn.Module):
 
     def __init__(self,
+                 device,
                  dim=128,
                  z_dim=4,
                  dim_mult=[1, 2, 4, 4],
@@ -451,11 +454,11 @@ class WanVAE(nn.Module):
         self.temperal_upsample = temperal_downsample[::-1]
 
         # modules
-        self.encoder = Encoder3d(dim, z_dim * 2, image_channels, dim_mult, num_res_blocks,
+        self.encoder = Encoder3d(device, dim, z_dim * 2, image_channels, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_downsample, dropout)
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
-        self.decoder = Decoder3d(dim, z_dim, conv_out_channels, dim_mult, num_res_blocks,
+        self.decoder = Decoder3d(device, dim, z_dim, conv_out_channels, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_upsample, dropout)
 
     def encode(self, x):

@@ -12,7 +12,7 @@ from .position_embedding import VideoRopePosition3DEmb, LearnablePosEmbAxis
 from torchvision import transforms
 
 import comfy.patcher_extension
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.ldm.common_dit
 import comfy.ops
 import comfy.quant_ops
@@ -20,7 +20,7 @@ import comfy.quant_ops
 
 # ---------------------- Feed Forward Network -----------------------
 class GPT2FeedForward(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None, operations=None) -> None:
+    def __init__(self, d_model: int, d_ff: int, device, dtype=None, operations=None) -> None:
         super().__init__()
         self.activation = nn.GELU()
         self.layer1 = operations.Linear(d_model, d_ff, bias=False, device=device, dtype=dtype)
@@ -36,36 +36,6 @@ class GPT2FeedForward(nn.Module):
         x = self.activation(x)
         x = self.layer2(x)
         return x
-
-
-def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
-    """Computes multi-head attention using PyTorch's native implementation.
-
-    This function provides a PyTorch backend alternative to Transformer Engine's attention operation.
-    It rearranges the input tensors to match PyTorch's expected format, computes scaled dot-product
-    attention, and rearranges the output back to the original format.
-
-    The input tensor names use the following dimension conventions:
-
-    - B: batch size
-    - S: sequence length
-    - H: number of attention heads
-    - D: head dimension
-
-    Args:
-        q_B_S_H_D: Query tensor with shape (batch, seq_len, n_heads, head_dim)
-        k_B_S_H_D: Key tensor with shape (batch, seq_len, n_heads, head_dim)
-        v_B_S_H_D: Value tensor with shape (batch, seq_len, n_heads, head_dim)
-
-    Returns:
-        Attention output tensor with shape (batch, seq_len, n_heads * head_dim)
-    """
-    in_q_shape = q_B_S_H_D.shape
-    in_k_shape = k_B_S_H_D.shape
-    q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
-    k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    return optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True, transformer_options=transformer_options)
 
 
 class Attention(nn.Module):
@@ -103,11 +73,11 @@ class Attention(nn.Module):
     def __init__(
         self,
         query_dim: int,
+        device,
         context_dim: Optional[int] = None,
         n_heads: int = 8,
         head_dim: int = 64,
         dropout: float = 0.0,
-        device=None,
         dtype=None,
         operations=None,
     ) -> None:
@@ -138,7 +108,17 @@ class Attention(nn.Module):
         self.output_proj = operations.Linear(inner_dim, query_dim, bias=False, device=device, dtype=dtype)
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
 
-        self.attn_op = torch_attention_op
+        self.optimized_attention = optimized_attention_for_device(device)
+
+        def attn_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+            in_q_shape = q.shape
+            in_k_shape = k.shape
+            q_B_H_S_D = rearrange(q, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
+            k_B_H_S_D = rearrange(k, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
+            v_B_H_S_D = rearrange(v, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
+            return self.optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True, transformer_options=transformer_options)
+
+        self.attn_op = attn_op
 
         self._query_dim = query_dim
         self._context_dim = context_dim
@@ -239,7 +219,7 @@ class Timesteps(nn.Module):
 
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, in_features: int, out_features: int, use_adaln_lora: bool = False, device=None, dtype=None, operations=None):
+    def __init__(self, in_features: int, out_features: int, device, use_adaln_lora: bool = False, dtype=None, operations=None):
         super().__init__()
         logging.debug(
             f"Using AdaLN LoRA Flag:  {use_adaln_lora}. We enable bias if no AdaLN LoRA for backward compatibility."
@@ -288,9 +268,10 @@ class PatchEmbed(nn.Module):
         self,
         spatial_patch_size: int,
         temporal_patch_size: int,
+        device,
         in_channels: int = 3,
         out_channels: int = 768,
-        device=None, dtype=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
         self.spatial_patch_size = spatial_patch_size
@@ -345,9 +326,10 @@ class FinalLayer(nn.Module):
         spatial_patch_size: int,
         temporal_patch_size: int,
         out_channels: int,
+        device,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
-        device=None, dtype=None, operations=None
+        dtype=None, operations=None
     ):
         super().__init__()
         self.layer_norm = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -426,21 +408,21 @@ class Block(nn.Module):
         x_dim: int,
         context_dim: int,
         num_heads: int,
+        device,
         mlp_ratio: float = 4.0,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
-        device=None,
         dtype=None,
         operations=None,
     ):
         super().__init__()
         self.x_dim = x_dim
         self.layer_norm_self_attn = operations.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
-        self.self_attn = Attention(x_dim, None, num_heads, x_dim // num_heads, device=device, dtype=dtype, operations=operations)
+        self.self_attn = Attention(x_dim, device, None, num_heads, x_dim // num_heads, dtype=dtype, operations=operations)
 
         self.layer_norm_cross_attn = operations.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
         self.cross_attn = Attention(
-            x_dim, context_dim, num_heads, x_dim // num_heads, device=device, dtype=dtype, operations=operations
+            x_dim, device, context_dim, num_heads, x_dim // num_heads, dtype=dtype, operations=operations
         )
 
         self.layer_norm_mlp = operations.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
@@ -628,6 +610,7 @@ class MiniTrainDIT(nn.Module):
 
     def __init__(
         self,
+        device,
         max_img_h: int,
         max_img_w: int,
         max_frames: int,
@@ -660,7 +643,6 @@ class MiniTrainDIT(nn.Module):
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
         image_model=None,
-        device=None,
         dtype=None,
         operations=None,
     ) -> None:

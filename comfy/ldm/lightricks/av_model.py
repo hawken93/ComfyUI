@@ -394,6 +394,7 @@ class LTXAVModel(LTXVModel):
 
     def __init__(
         self,
+        device,
         in_channels=128,
         audio_in_channels=128,
         cross_attention_dim=4096,
@@ -419,7 +420,6 @@ class LTXAVModel(LTXVModel):
         audio_ff_bias=True,
         use_prompt_adaln_single=True,
         dtype=None,
-        device=None,
         operations=None,
         **kwargs,
     ):

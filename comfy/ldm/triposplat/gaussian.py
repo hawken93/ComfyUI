@@ -7,9 +7,11 @@ import comfy.model_management
 
 
 class GaussianModel:
-    def __init__(self, aabb: list, sh_degree: int = 0, mininum_kernel_size: float = 0.0,
+    def __init__(self, device, output_device, aabb: list, sh_degree: int = 0,
+                 mininum_kernel_size: float = 0.0,
                  scaling_bias: float = 0.01, opacity_bias: float = 0.1,
-                 scaling_activation: str = "exp", device=None):
+                 scaling_activation: str = "exp"):
+        self.output_device = output_device
         self.sh_degree = sh_degree
         self.mininum_kernel_size = mininum_kernel_size
         self.scaling_bias = scaling_bias
@@ -120,7 +122,7 @@ class GaussianModel:
         xyz = xyz @ T.T
         rotation = _matrix_to_quat(torch.matmul(T, _quat_to_matrix(rotation)))
         rotation = rotation / torch.linalg.norm(rotation, dim=-1, keepdim=True)
-        out_device = comfy.model_management.intermediate_device()
+        out_device = self.output_device
         return (
             xyz.to(out_device).contiguous(), scaling.to(out_device).contiguous(),
             rotation.to(out_device).contiguous(), opacity.to(out_device).contiguous(),
@@ -169,7 +171,7 @@ def _matrix_to_quat(R):
     return q / torch.linalg.norm(q, dim=-1, keepdim=True)
 
 
-def build_gaussian_models(decoder, points_pred: dict, pred: dict):
+def build_gaussian_models(device, output_device, decoder, points_pred: dict, pred: dict):
     # Assemble GaussianModels from the elastic decoder layout. decoder is the ElasticGaussianFixedlenDecoder
     # (carries layout / rep_config / _get_offset)
     x = points_pred
@@ -178,13 +180,14 @@ def build_gaussian_models(decoder, points_pred: dict, pred: dict):
     ret = []
     for i in range(h.shape[0]):
         g = GaussianModel(
+            device,
+            output_device,
             sh_degree=0,
             aabb=[-0.5, -0.5, -0.5, 1.0, 1.0, 1.0],
             mininum_kernel_size=decoder.rep_config['filter_kernel_size_3d'],
             scaling_bias=decoder.rep_config['scaling_bias'],
             opacity_bias=decoder.rep_config['opacity_bias'],
             scaling_activation=decoder.rep_config['scaling_activation'],
-            device=h.device,
         )
         _x = x["points"][i, :, None, :]
         for k, v in decoder.layout.items():

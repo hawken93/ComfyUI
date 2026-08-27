@@ -22,11 +22,11 @@ from torch import nn
 from .common import AttnBlock, LayerNorm2d_op, ResBlock, FeedForwardBlock, TimestepBlock
 
 class StageB(nn.Module):
-    def __init__(self, c_in=4, c_out=4, c_r=64, patch_size=2, c_cond=1280, c_hidden=[320, 640, 1280, 1280],
+    def __init__(self, device, c_in=4, c_out=4, c_r=64, patch_size=2, c_cond=1280, c_hidden=[320, 640, 1280, 1280],
                  nhead=[-1, -1, 20, 20], blocks=[[2, 6, 28, 6], [6, 28, 6, 2]],
                  block_repeat=[[1, 1, 1, 1], [3, 3, 2, 2]], level_config=['CT', 'CT', 'CTA', 'CTA'], c_clip=1280,
                  c_clip_seq=4, c_effnet=16, c_pixels=3, kernel_size=3, dropout=[0, 0, 0.0, 0.0], self_attn=True,
-                 t_conds=['sca'], stable_cascade_stage=None, dtype=None, device=None, operations=None):
+                 t_conds=['sca'], stable_cascade_stage=None, dtype=None, operations=None):
         super().__init__()
         self.dtype = dtype
         self.c_r = c_r

@@ -9,7 +9,7 @@ from einops import rearrange, repeat
 from comfy.ldm.lightricks.model import Timesteps
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.flux.math import apply_rope1
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 import comfy.ldm.common_dit
 
@@ -26,7 +26,7 @@ def swiglu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, in_channels: int, time_embed_dim: int, dtype=None, device=None, operations=None):
+    def __init__(self, device, in_channels: int, time_embed_dim: int, dtype=None, operations=None):
         super().__init__()
         self.linear_1 = operations.Linear(in_channels, time_embed_dim, dtype=dtype, device=device)
         self.act = nn.SiLU()
@@ -40,7 +40,7 @@ class TimestepEmbedding(nn.Module):
 
 
 class LuminaRMSNormZero(nn.Module):
-    def __init__(self, embedding_dim: int, norm_eps: float = 1e-5, dtype=None, device=None, operations=None):
+    def __init__(self, device, embedding_dim: int, norm_eps: float = 1e-5, dtype=None, operations=None):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear = operations.Linear(min(embedding_dim, 1024), 4 * embedding_dim, dtype=dtype, device=device)
@@ -54,7 +54,7 @@ class LuminaRMSNormZero(nn.Module):
 
 
 class LuminaLayerNormContinuous(nn.Module):
-    def __init__(self, embedding_dim: int, conditioning_embedding_dim: int, elementwise_affine: bool = False, eps: float = 1e-6, out_dim: Optional[int] = None, dtype=None, device=None, operations=None):
+    def __init__(self, device, embedding_dim: int, conditioning_embedding_dim: int, elementwise_affine: bool = False, eps: float = 1e-6, out_dim: Optional[int] = None, dtype=None, operations=None):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear_1 = operations.Linear(conditioning_embedding_dim, embedding_dim, dtype=dtype, device=device)
@@ -70,7 +70,7 @@ class LuminaLayerNormContinuous(nn.Module):
 
 
 class LuminaFeedForward(nn.Module):
-    def __init__(self, dim: int, inner_dim: int, multiple_of: int = 256, dtype=None, device=None, operations=None):
+    def __init__(self, device, dim: int, inner_dim: int, multiple_of: int = 256, dtype=None, operations=None):
         super().__init__()
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
         self.linear_1 = operations.Linear(dim, inner_dim, bias=False, dtype=dtype, device=device)
@@ -83,7 +83,7 @@ class LuminaFeedForward(nn.Module):
 
 
 class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
-    def __init__(self, hidden_size: int = 4096, text_feat_dim: int = 2048, frequency_embedding_size: int = 256, norm_eps: float = 1e-5, timestep_scale: float = 1.0, dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden_size: int = 4096, text_feat_dim: int = 2048, frequency_embedding_size: int = 256, norm_eps: float = 1e-5, timestep_scale: float = 1.0, dtype=None, operations=None):
         super().__init__()
         self.time_proj = Timesteps(num_channels=frequency_embedding_size, flip_sin_to_cos=True, downscale_freq_shift=0.0, scale=timestep_scale)
         self.timestep_embedder = TimestepEmbedding(in_channels=frequency_embedding_size, time_embed_dim=min(hidden_size, 1024), dtype=dtype, device=device, operations=operations)
@@ -100,8 +100,9 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, query_dim: int, dim_head: int, heads: int, kv_heads: int, eps: float = 1e-5, bias: bool = False, dtype=None, device=None, operations=None):
+    def __init__(self, device, query_dim: int, dim_head: int, heads: int, kv_heads: int, eps: float = 1e-5, bias: bool = False, dtype=None, operations=None):
         super().__init__()
+        self.optimized_attention = optimized_attention_for_device(device)
         self.heads = heads
         self.kv_heads = kv_heads
         self.dim_head = dim_head
@@ -142,13 +143,13 @@ class Attention(nn.Module):
         value = value.transpose(1, 2)
 
         gqa_kwargs = {"enable_gqa": True} if self.kv_heads < self.heads else {}
-        hidden_states = optimized_attention_masked(query, key, value, self.heads, attention_mask, skip_reshape=True, transformer_options=transformer_options, **gqa_kwargs)
+        hidden_states = self.optimized_attention(query, key, value, self.heads, attention_mask, skip_reshape=True, transformer_options=transformer_options, **gqa_kwargs)
         hidden_states = self.to_out[0](hidden_states)
         return hidden_states
 
 
 class OmniGen2TransformerBlock(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, num_kv_heads: int, multiple_of: int, ffn_dim_multiplier: float, norm_eps: float, modulation: bool = True, dtype=None, device=None, operations=None):
+    def __init__(self, device, dim: int, num_attention_heads: int, num_kv_heads: int, multiple_of: int, ffn_dim_multiplier: float, norm_eps: float, modulation: bool = True, dtype=None, operations=None):
         super().__init__()
         self.modulation = modulation
 
@@ -269,6 +270,7 @@ class OmniGen2RotaryPosEmbed(nn.Module):
 class OmniGen2Transformer2DModel(nn.Module):
     def __init__(
         self,
+        device,
         patch_size: int = 2,
         in_channels: int = 16,
         out_channels: Optional[int] = None,
@@ -285,7 +287,6 @@ class OmniGen2Transformer2DModel(nn.Module):
         text_feat_dim: int = 1024,
         timestep_scale: float = 1.0,
         image_model=None,
-        device=None,
         dtype=None,
         operations=None,
     ):

@@ -3,7 +3,7 @@ import torch.nn as nn
 
 import comfy.ops
 import comfy.model_management
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.audio.autoencoder import WNConv1d
 
 ops = comfy.ops.disable_weight_init
@@ -36,7 +36,7 @@ def _sliding_window_mask(seq_len, window, device, dtype):
 
 
 class DynamicTanh(nn.Module):
-    def __init__(self, dim, init_alpha=4.0, dtype=None, device=None, **kwargs):
+    def __init__(self, dim, device, init_alpha=4.0, dtype=None, **kwargs):
         super().__init__()
         self.alpha = nn.Parameter(torch.empty(1, dtype=dtype, device=device))
         self.gamma = nn.Parameter(torch.empty(dim, dtype=dtype, device=device))
@@ -50,7 +50,7 @@ class DynamicTanh(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, base=10000, base_rescale_factor=1., dtype=None, device=None):
+    def __init__(self, dim, device, base=10000, base_rescale_factor=1., dtype=None):
         super().__init__()
         base = base * base_rescale_factor ** (dim / (dim - 2))
         self.register_buffer("inv_freq", torch.empty(dim // 2, dtype=dtype, device=device))
@@ -81,11 +81,12 @@ def _apply_rotary_pos_emb(t, freqs):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, dim_heads=64, qk_norm="none", qk_norm_eps=1e-6,
+    def __init__(self, dim, device, dim_heads=64, qk_norm="none", qk_norm_eps=1e-6,
                  differential=False, zero_init_output=True,
-                 dtype=None, device=None, operations=None, **kwargs):
+                 dtype=None, operations=None, **kwargs):
         super().__init__()
         self.num_heads = dim // dim_heads
+        self.optimized_attention = optimized_attention_for_device(device)
         self.differential = differential
         self.qk_norm = qk_norm
 
@@ -138,11 +139,11 @@ class Attention(nn.Module):
                 k_diff = _apply_rotary_pos_emb(k_diff.float(), freqs).to(k_dtype)
 
         if self.differential:
-            out = (optimized_attention(q, k, v, h, mask=mask, skip_reshape=True, low_precision_attention=False)
-                   - optimized_attention(q_diff, k_diff, v, h, mask=mask, skip_reshape=True, low_precision_attention=False))
+            out = (self.optimized_attention(q, k, v, h, mask=mask, skip_reshape=True, low_precision_attention=False)
+                   - self.optimized_attention(q_diff, k_diff, v, h, mask=mask, skip_reshape=True, low_precision_attention=False))
             del q, k, v, q_diff, k_diff
         else:
-            out = optimized_attention(q, k, v, h, mask=mask, skip_reshape=True, low_precision_attention=False)
+            out = self.optimized_attention(q, k, v, h, mask=mask, skip_reshape=True, low_precision_attention=False)
             del q, k, v
 
         return self.to_out(out)
@@ -154,7 +155,7 @@ class _Sin(nn.Module):
 
 
 class _GLU(nn.Module):
-    def __init__(self, dim_in, dim_out, activation, dtype=None, device=None, operations=None):
+    def __init__(self, dim_in, dim_out, activation, device, dtype=None, operations=None):
         super().__init__()
         self.act = activation
         self.proj = operations.Linear(dim_in, dim_out * 2, dtype=dtype, device=device)
@@ -166,8 +167,8 @@ class _GLU(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, mult=4, no_bias=False, zero_init_output=True,
-                 sinusoidal=False, dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, dim, device, mult=4, no_bias=False, zero_init_output=True,
+                 sinusoidal=False, dtype=None, operations=None, **kwargs):
         super().__init__()
         inner_dim = int(dim * mult)
         act = _Sin() if sinusoidal else nn.SiLU()
@@ -183,9 +184,9 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, dim_heads=64, causal=False, zero_init_branch_outputs=True,
+    def __init__(self, dim, device, dim_heads=64, causal=False, zero_init_branch_outputs=True,
                  norm_type="dyt", add_rope=False, attn_kwargs=None, ff_kwargs=None,
-                 norm_kwargs=None, dtype=None, device=None, operations=None, **kwargs):
+                 norm_kwargs=None, dtype=None, operations=None, **kwargs):
         super().__init__()
         if attn_kwargs is None:
             attn_kwargs = {}
@@ -217,11 +218,11 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerResamplingBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, type="encoder",
+    def __init__(self, in_channels, out_channels, stride, device, type="encoder",
                  transformer_depth=3, dim_heads=128, differential=True,
                  sliding_window=None, chunk_size=128, chunk_midpoint_shift=False,
                  dyt=True, ff_mult=3, mapping_bias=True, variable_stride=False,
-                 sinusoidal_blocks=0, conv_mapping=False, dtype=None, device=None, operations=None, **kwargs):
+                 sinusoidal_blocks=0, conv_mapping=False, dtype=None, operations=None, **kwargs):
         super().__init__()
         if type not in ("encoder", "decoder"):
             raise ValueError(f"type must be 'encoder' or 'decoder', got {type!r}")
@@ -353,10 +354,10 @@ class TransformerResamplingBlock(nn.Module):
 
 
 class SAMEEncoder(nn.Module):
-    def __init__(self, in_channels=2, channels=128, latent_dim=32,
+    def __init__(self, device, in_channels=2, channels=128, latent_dim=32,
                  c_mults=(1, 2, 4, 8), strides=(2, 4, 8, 8),
                  transformer_depths=(3, 3, 3, 3),
-                 dtype=None, device=None, operations=None, **kwargs):
+                 dtype=None, operations=None, **kwargs):
         super().__init__()
         channel_dims = [in_channels] + [channels * c for c in c_mults]
         layers = []
@@ -380,10 +381,10 @@ class SAMEEncoder(nn.Module):
 
 
 class SAMEDecoder(nn.Module):
-    def __init__(self, out_channels=2, channels=128, latent_dim=32,
+    def __init__(self, device, out_channels=2, channels=128, latent_dim=32,
                  c_mults=(1, 2, 4, 8), strides=(2, 4, 8, 8),
                  transformer_depths=(3, 3, 3, 3), sinusoidal_blocks=None,
-                 dtype=None, device=None, operations=None, **kwargs):
+                 dtype=None, operations=None, **kwargs):
         super().__init__()
         if sinusoidal_blocks is None:
             sinusoidal_blocks = [0] * len(c_mults)
@@ -409,8 +410,8 @@ class SAMEDecoder(nn.Module):
 
 
 class SoftNormBottleneck(nn.Module):
-    def __init__(self, dim=32, noise_augment_dim=0, noise_regularize=False,
-                 auto_scale=False, freeze=False, dtype=None, device=None, **kwargs):
+    def __init__(self, device, dim=32, noise_augment_dim=0, noise_regularize=False,
+                 auto_scale=False, freeze=False, dtype=None, **kwargs):
         super().__init__()
         self.noise_augment_dim = noise_augment_dim
         self.noise_regularize = noise_regularize
@@ -480,10 +481,10 @@ class PatchedPretransform(nn.Module):
 class SA3AudioVAE(nn.Module):
     """SA3 VAE. State dict keys match checkpoint after stripping 'pretransform.model.'"""
 
-    def __init__(self, channels=256, transformer_depths=12, sinusoidal_blocks=8,
+    def __init__(self, device, channels=256, transformer_depths=12, sinusoidal_blocks=8,
                  sliding_window=None, decoder_conv_mapping=False,
                  chunk_size=128, chunk_midpoint_shift=False,
-                 dtype=None, device=None, operations=None):
+                 dtype=None, operations=None):
         super().__init__()
         if operations is None:
             operations = ops

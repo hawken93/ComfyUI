@@ -11,7 +11,7 @@ import comfy.ops
 import comfy.quant_ops
 
 from comfy.ldm.modules.diffusionmodules.mmdit import TimestepEmbedder
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.layers import EmbedND
 from comfy.ldm.flux.math import apply_rope
 import comfy.patcher_extension
@@ -78,12 +78,14 @@ class JointAttention(nn.Module):
 
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         n_heads: int,
         n_kv_heads: Optional[int],
         qk_norm: bool,
         out_bias: bool = False,
-        operation_settings={},
+        dtype=None,
     ):
         """
         Initialize the Attention module.
@@ -102,24 +104,25 @@ class JointAttention(nn.Module):
         self.head_dim = dim // n_heads
         self.qk_norm = qk_norm
 
-        self.qkv = operation_settings.get("operations").Linear(
+        self.optimized_attention = optimized_attention_for_device(device, need_mask=True)
+        self.qkv = operations.Linear(
             dim,
             (n_heads + self.n_kv_heads + self.n_kv_heads) * self.head_dim,
             bias=False,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
+            device=device,
+            dtype=dtype,
         )
-        self.out = operation_settings.get("operations").Linear(
+        self.out = operations.Linear(
             n_heads * self.head_dim,
             dim,
             bias=out_bias,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
+            device=device,
+            dtype=dtype,
         )
 
         if qk_norm:
-            self.q_norm = operation_settings.get("operations").RMSNorm(self.head_dim, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-            self.k_norm = operation_settings.get("operations").RMSNorm(self.head_dim, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+            self.q_norm = operations.RMSNorm(self.head_dim, elementwise_affine=True, device=device, dtype=dtype)
+            self.k_norm = operations.RMSNorm(self.head_dim, elementwise_affine=True, device=device, dtype=dtype)
         else:
             self.q_norm = self.k_norm = nn.Identity()
 
@@ -175,7 +178,7 @@ class JointAttention(nn.Module):
         if n_rep >= 1:
             xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
             xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-        output = optimized_attention_masked(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
+        output = self.optimized_attention(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
 
         return self.out(output)
 
@@ -183,11 +186,13 @@ class JointAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
-        operation_settings={},
+        dtype=None,
     ):
         """
         Initialize the FeedForward module.
@@ -207,27 +212,9 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = operation_settings.get("operations").Linear(
-            dim,
-            hidden_dim,
-            bias=False,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
-        )
-        self.w2 = operation_settings.get("operations").Linear(
-            hidden_dim,
-            dim,
-            bias=False,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
-        )
-        self.w3 = operation_settings.get("operations").Linear(
-            dim,
-            hidden_dim,
-            bias=False,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
-        )
+        self.w1 = operations.Linear(dim, hidden_dim, bias=False, device=device, dtype=dtype)
+        self.w2 = operations.Linear(hidden_dim, dim, bias=False, device=device, dtype=dtype)
+        self.w3 = operations.Linear(dim, hidden_dim, bias=False, device=device, dtype=dtype)
 
     # @torch.compile
     def _forward_silu_gating(self, x1, x3):
@@ -240,6 +227,8 @@ class FeedForward(nn.Module):
 class JointTransformerBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         layer_id: int,
         dim: int,
         n_heads: int,
@@ -251,7 +240,7 @@ class JointTransformerBlock(nn.Module):
         modulation=True,
         z_image_modulation=False,
         attn_out_bias=False,
-        operation_settings={},
+        dtype=None,
     ) -> None:
         """
         Initialize a TransformerBlock.
@@ -271,43 +260,25 @@ class JointTransformerBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // n_heads
-        self.attention = JointAttention(dim, n_heads, n_kv_heads, qk_norm, out_bias=attn_out_bias, operation_settings=operation_settings)
-        self.feed_forward = FeedForward(
-            dim=dim,
-            hidden_dim=dim,
-            multiple_of=multiple_of,
-            ffn_dim_multiplier=ffn_dim_multiplier,
-            operation_settings=operation_settings,
-        )
+        self.attention = JointAttention(device, operations, dim, n_heads, n_kv_heads, qk_norm, out_bias=attn_out_bias, dtype=dtype)
+        self.feed_forward = FeedForward(device, operations, dim, dim, multiple_of, ffn_dim_multiplier, dtype=dtype)
         self.layer_id = layer_id
-        self.attention_norm1 = operation_settings.get("operations").RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.ffn_norm1 = operation_settings.get("operations").RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.attention_norm1 = operations.RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype)
+        self.ffn_norm1 = operations.RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype)
 
-        self.attention_norm2 = operation_settings.get("operations").RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.ffn_norm2 = operation_settings.get("operations").RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.attention_norm2 = operations.RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype)
+        self.ffn_norm2 = operations.RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype)
 
         self.modulation = modulation
         if modulation:
             if z_image_modulation:
                 self.adaLN_modulation = nn.Sequential(
-                    operation_settings.get("operations").Linear(
-                        min(dim, 256),
-                        4 * dim,
-                        bias=True,
-                        device=operation_settings.get("device"),
-                        dtype=operation_settings.get("dtype"),
-                    ),
+                    operations.Linear(min(dim, 256), 4 * dim, bias=True, device=device, dtype=dtype),
                 )
             else:
                 self.adaLN_modulation = nn.Sequential(
                     nn.SiLU(),
-                    operation_settings.get("operations").Linear(
-                        min(dim, 1024),
-                        4 * dim,
-                        bias=True,
-                        device=operation_settings.get("device"),
-                        dtype=operation_settings.get("dtype"),
-                    ),
+                    operations.Linear(min(dim, 1024), 4 * dim, bias=True, device=device, dtype=dtype),
                 )
 
     def forward(
@@ -371,37 +342,15 @@ class FinalLayer(nn.Module):
     The final layer of NextDiT.
     """
 
-    def __init__(self, hidden_size, patch_size, out_channels, z_image_modulation=False, operation_settings={}):
+    def __init__(self, device, operations, hidden_size, patch_size, out_channels, z_image_modulation=False, dtype=None):
         super().__init__()
-        self.norm_final = operation_settings.get("operations").LayerNorm(
-            hidden_size,
-            elementwise_affine=False,
-            eps=1e-6,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
-        )
-        self.linear = operation_settings.get("operations").Linear(
-            hidden_size,
-            patch_size * patch_size * out_channels,
-            bias=True,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
-        )
+        self.norm_final = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
+        self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, device=device, dtype=dtype)
 
-        if z_image_modulation:
-            min_mod = 256
-        else:
-            min_mod = 1024
-
+        min_mod = 256 if z_image_modulation else 1024
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            operation_settings.get("operations").Linear(
-                min(hidden_size, min_mod),
-                hidden_size,
-                bias=True,
-                device=operation_settings.get("device"),
-                dtype=operation_settings.get("dtype"),
-            ),
+            operations.Linear(min(hidden_size, min_mod), hidden_size, bias=True, device=device, dtype=dtype),
         )
 
     def forward(self, x, c, timestep_zero_index=None):
@@ -442,6 +391,8 @@ class NextDiT(nn.Module):
 
     def __init__(
         self,
+        device,
+        operations,
         patch_size: int = 2,
         in_channels: int = 4,
         dim: int = 4096,
@@ -463,31 +414,30 @@ class NextDiT(nn.Module):
         clip_text_dim=None,
         siglip_feat_dim=None,
         image_model=None,
-        device=None,
         dtype=None,
-        operations=None,
         **kwargs,
     ) -> None:
         super().__init__()
         self.dtype = dtype
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
         self.time_scale = time_scale
         self.pad_tokens_multiple = pad_tokens_multiple
 
-        self.x_embedder = operation_settings.get("operations").Linear(
+        self.x_embedder = operations.Linear(
             in_features=patch_size * patch_size * in_channels,
             out_features=dim,
             bias=True,
-            device=operation_settings.get("device"),
-            dtype=operation_settings.get("dtype"),
+            device=device,
+            dtype=dtype,
         )
 
         self.noise_refiner = nn.ModuleList(
             [
                 JointTransformerBlock(
+                    device,
+                    operations,
                     layer_id,
                     dim,
                     n_heads,
@@ -498,7 +448,7 @@ class NextDiT(nn.Module):
                     qk_norm,
                     modulation=True,
                     z_image_modulation=z_image_modulation,
-                    operation_settings=operation_settings,
+                    dtype=dtype,
                 )
                 for layer_id in range(n_refiner_layers)
             ]
@@ -506,6 +456,8 @@ class NextDiT(nn.Module):
         self.context_refiner = nn.ModuleList(
             [
                 JointTransformerBlock(
+                    device,
+                    operations,
                     layer_id,
                     dim,
                     n_heads,
@@ -515,21 +467,27 @@ class NextDiT(nn.Module):
                     norm_eps,
                     qk_norm,
                     modulation=False,
-                    operation_settings=operation_settings,
+                    dtype=dtype,
                 )
                 for layer_id in range(n_refiner_layers)
             ]
         )
 
-        self.t_embedder = TimestepEmbedder(min(dim, 1024), output_size=256 if z_image_modulation else None, **operation_settings)
+        self.t_embedder = TimestepEmbedder(
+            device,
+            operations,
+            min(dim, 1024),
+            output_size=256 if z_image_modulation else None,
+            dtype=dtype,
+        )
         self.cap_embedder = nn.Sequential(
-            operation_settings.get("operations").RMSNorm(cap_feat_dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")),
-            operation_settings.get("operations").Linear(
+            operations.RMSNorm(cap_feat_dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype),
+            operations.Linear(
                 cap_feat_dim,
                 dim,
                 bias=True,
-                device=operation_settings.get("device"),
-                dtype=operation_settings.get("dtype"),
+                device=device,
+                dtype=dtype,
             ),
         )
 
@@ -538,29 +496,31 @@ class NextDiT(nn.Module):
         if clip_text_dim is not None:
             self.clip_text_dim = clip_text_dim
             self.clip_text_pooled_proj = nn.Sequential(
-                operation_settings.get("operations").RMSNorm(clip_text_dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")),
-                operation_settings.get("operations").Linear(
+                operations.RMSNorm(clip_text_dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype),
+                operations.Linear(
                     clip_text_dim,
                     clip_text_dim,
                     bias=True,
-                    device=operation_settings.get("device"),
-                    dtype=operation_settings.get("dtype"),
+                    device=device,
+                    dtype=dtype,
                 ),
             )
             self.time_text_embed = nn.Sequential(
                 nn.SiLU(),
-                operation_settings.get("operations").Linear(
+                operations.Linear(
                     min(dim, 1024) + clip_text_dim,
                     min(dim, 1024),
                     bias=True,
-                    device=operation_settings.get("device"),
-                    dtype=operation_settings.get("dtype"),
+                    device=device,
+                    dtype=dtype,
                 ),
             )
 
         self.layers = nn.ModuleList(
             [
                 JointTransformerBlock(
+                    device,
+                    operations,
                     layer_id,
                     dim,
                     n_heads,
@@ -571,7 +531,7 @@ class NextDiT(nn.Module):
                     qk_norm,
                     z_image_modulation=z_image_modulation,
                     attn_out_bias=False,
-                    operation_settings=operation_settings,
+                    dtype=dtype,
                 )
                 for layer_id in range(n_layers)
             ]
@@ -579,18 +539,20 @@ class NextDiT(nn.Module):
 
         if siglip_feat_dim is not None:
             self.siglip_embedder = nn.Sequential(
-                operation_settings.get("operations").RMSNorm(siglip_feat_dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype")),
-                operation_settings.get("operations").Linear(
+                operations.RMSNorm(siglip_feat_dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype),
+                operations.Linear(
                     siglip_feat_dim,
                     dim,
                     bias=True,
-                    device=operation_settings.get("device"),
-                    dtype=operation_settings.get("dtype"),
+                    device=device,
+                    dtype=dtype,
                 ),
             )
             self.siglip_refiner = nn.ModuleList(
                 [
                     JointTransformerBlock(
+                        device,
+                        operations,
                         layer_id,
                         dim,
                         n_heads,
@@ -600,7 +562,7 @@ class NextDiT(nn.Module):
                         norm_eps,
                         qk_norm,
                         modulation=False,
-                        operation_settings=operation_settings,
+                        dtype=dtype,
                     )
                     for layer_id in range(n_refiner_layers)
                 ]
@@ -612,8 +574,8 @@ class NextDiT(nn.Module):
             self.siglip_pad_token = None
 
         # This norm final is in the lumina 2.0 code but isn't actually used for anything.
-        # self.norm_final = operation_settings.get("operations").RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.final_layer = FinalLayer(dim, patch_size, self.out_channels, z_image_modulation=z_image_modulation, operation_settings=operation_settings)
+        # self.norm_final = operations.RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=device, dtype=dtype)
+        self.final_layer = FinalLayer(device, operations, dim, patch_size, self.out_channels, z_image_modulation=z_image_modulation, dtype=dtype)
 
         if self.pad_tokens_multiple is not None:
             self.x_pad_token = nn.Parameter(torch.empty((1, dim), device=device, dtype=dtype))
@@ -888,7 +850,7 @@ class PixelResBlock(nn.Module):
     an identity at the beginning of training.
     """
 
-    def __init__(self, channels: int, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, channels: int, dtype=None):
         super().__init__()
         self.in_ln = operations.LayerNorm(channels, eps=1e-6, dtype=dtype, device=device)
         self.mlp = nn.Sequential(
@@ -911,7 +873,7 @@ class PixelResBlock(nn.Module):
 class DCTFinalLayer(nn.Module):
     """Zero-initialised output projection (adopted from DiT)."""
 
-    def __init__(self, model_channels: int, out_channels: int, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, model_channels: int, out_channels: int, dtype=None):
         super().__init__()
         self.norm_final = operations.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(model_channels, out_channels, bias=True, dtype=dtype, device=device)
@@ -934,6 +896,8 @@ class SimpleMLPAdaLN(nn.Module):
 
     def __init__(
         self,
+        device,
+        operations,
         in_channels: int,
         model_channels: int,
         out_channels: int,
@@ -941,8 +905,6 @@ class SimpleMLPAdaLN(nn.Module):
         num_res_blocks: int,
         max_freqs: int = 8,
         dtype=None,
-        device=None,
-        operations=None,
     ):
         super().__init__()
         self.dtype = dtype
@@ -962,11 +924,11 @@ class SimpleMLPAdaLN(nn.Module):
 
         # Residual blocks
         self.res_blocks = nn.ModuleList([
-            PixelResBlock(model_channels, dtype=dtype, device=device, operations=operations) for _ in range(num_res_blocks)
+            PixelResBlock(device, operations, model_channels, dtype=dtype) for _ in range(num_res_blocks)
         ])
 
         # Output projection
-        self.final_layer = DCTFinalLayer(model_channels, out_channels, dtype=dtype, device=device, operations=operations)
+        self.final_layer = DCTFinalLayer(device, operations, model_channels, out_channels, dtype=dtype)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         # x: [B*N, 1, P^2*C],  c: [B*N, dim]
@@ -1002,37 +964,39 @@ class NextDiTPixelSpace(NextDiT):
 
     def __init__(
         self,
+        device,
+        operations,
+        patch_size: int = 2,
+        in_channels: int = 4,
+        dim: int = 4096,
         # decoder-specific
         decoder_hidden_size: int = 3840,
         decoder_num_res_blocks: int = 4,
         decoder_max_freqs: int = 8,
         decoder_in_channels: int = None,  # full flattened patch size (patch_size^2 * in_channels)
         use_x0: bool = False,
-        # all NextDiT args forwarded unchanged
+        dtype=None,
+        # all other NextDiT args forwarded unchanged
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(device, operations, patch_size=patch_size, in_channels=in_channels, dim=dim, dtype=dtype, **kwargs)
 
         # Remove the latent-space final layer – not used in pixel space
         del self.final_layer
-
-        patch_size = kwargs.get("patch_size", 2)
-        in_channels = kwargs.get("in_channels", 4)
-        dim = kwargs.get("dim", 4096)
 
         # decoder_in_channels is the full flattened patch: patch_size^2 * in_channels
         dec_in_ch = decoder_in_channels if decoder_in_channels is not None else patch_size ** 2 * in_channels
 
         self.dec_net = SimpleMLPAdaLN(
-            in_channels=dec_in_ch,
-            model_channels=decoder_hidden_size,
-            out_channels=dec_in_ch,
-            z_channels=dim,
-            num_res_blocks=decoder_num_res_blocks,
+            device,
+            operations,
+            dec_in_ch,
+            decoder_hidden_size,
+            dec_in_ch,
+            dim,
+            decoder_num_res_blocks,
             max_freqs=decoder_max_freqs,
-            dtype=kwargs.get("dtype"),
-            device=kwargs.get("device"),
-            operations=kwargs.get("operations"),
+            dtype=dtype,
         )
 
         if use_x0:

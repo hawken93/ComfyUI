@@ -36,7 +36,7 @@ class RTDETR_detect(io.ComfyNode):
         results = []
         for i in range(0, B, 32):
             batch = image[i:i + 32]
-            image_in = comfy.utils.common_upscale(batch.movedim(-1, 1), 640, 640, "bilinear", crop="disabled")
+            image_in = comfy.utils.common_upscale(batch.movedim(-1, 1), 640, 640, "bilinear", crop="disabled").to(model.load_device)
             results.extend(model.model.diffusion_model(image_in, (W, H)))
 
         all_bbox_dicts = []
@@ -121,7 +121,8 @@ class DrawBBoxes(io.ComfyNode):
                 img = cls.draw_detections(img, boxes, labels, scores)
             all_out_images.append(ToTensor()(img).unsqueeze(0).movedim(1, -1))
 
-        out_images = torch.cat(all_out_images, dim=0).to(comfy.model_management.intermediate_device())
+        intermediate_device = comfy.model_management.intermediate_device(model.load_device)
+        out_images = torch.cat(all_out_images, dim=0).to(intermediate_device)
         return io.NodeOutput(out_images)
 
     @classmethod

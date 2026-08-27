@@ -60,6 +60,7 @@ class DepthAnything3Net(nn.Module):
 
     def __init__(
         self,
+        device,
         # --- Backbone ---
         backbone_name: str = "vitl",
         out_layers: Sequence[int] = (4, 11, 17, 23),
@@ -81,7 +82,7 @@ class DepthAnything3Net(nn.Module):
         cam_dim_out: Optional[int] = None,  # CameraEnc dim_out (defaults to embed_dim)
         cam_dec_dim_in: Optional[int] = None,  # CameraDec dim_in  (defaults to 2*embed_dim with cat_token)
         # ComfyUI plumbing
-        device=None, dtype=None, operations=None,
+        dtype=None, operations=None,
         **_ignored,
     ):
         super().__init__()

@@ -4,7 +4,7 @@ import torch
 import comfy.patcher_extension
 import comfy.ldm.flux.layers
 import comfy.ldm.modules.diffusionmodules.mmdit
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 from dataclasses import dataclass
 from einops import repeat
@@ -47,7 +47,7 @@ class HunyuanVideoParams:
 
 
 class SelfAttentionRef(nn.Module):
-    def __init__(self, dim: int, qkv_bias: bool = False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, dim: int, qkv_bias: bool = False, dtype=None):
         super().__init__()
         self.qkv = operations.Linear(dim, dim * 3, bias=qkv_bias, dtype=dtype, device=device)
         self.proj = operations.Linear(dim, dim, dtype=dtype, device=device)
@@ -56,14 +56,15 @@ class SelfAttentionRef(nn.Module):
 class TokenRefinerBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         hidden_size,
         heads,
-        dtype=None,
-        device=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
         self.heads = heads
+        self.optimized_attention = optimized_attention_for_device(device)
         mlp_hidden_dim = hidden_size * 4
 
         self.adaLN_modulation = nn.Sequential(
@@ -72,7 +73,7 @@ class TokenRefinerBlock(nn.Module):
         )
 
         self.norm1 = operations.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6, dtype=dtype, device=device)
-        self.self_attn = SelfAttentionRef(hidden_size, True, dtype=dtype, device=device, operations=operations)
+        self.self_attn = SelfAttentionRef(device, operations, hidden_size, True, dtype=dtype)
 
         self.norm2 = operations.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6, dtype=dtype, device=device)
 
@@ -88,7 +89,7 @@ class TokenRefinerBlock(nn.Module):
         norm_x = self.norm1(x)
         qkv = self.self_attn.qkv(norm_x)
         q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-        attn = optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
+        attn = self.optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
 
         x = x + self.self_attn.proj(attn) * mod1.unsqueeze(1)
         x = x + self.mlp(self.norm2(x)) * mod2.unsqueeze(1)
@@ -98,22 +99,22 @@ class TokenRefinerBlock(nn.Module):
 class IndividualTokenRefiner(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         hidden_size,
         heads,
         num_blocks,
-        dtype=None,
-        device=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
             [
                 TokenRefinerBlock(
-                    hidden_size=hidden_size,
-                    heads=heads,
-                    dtype=dtype,
-                    device=device,
-                    operations=operations
+                    device,
+                    operations,
+                    hidden_size,
+                    heads,
+                    dtype=dtype
                 )
                 for _ in range(num_blocks)
             ]
@@ -134,20 +135,20 @@ class IndividualTokenRefiner(nn.Module):
 class TokenRefiner(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         text_dim,
         hidden_size,
         heads,
         num_blocks,
-        dtype=None,
-        device=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
 
         self.input_embedder = operations.Linear(text_dim, hidden_size, bias=True, dtype=dtype, device=device)
         self.t_embedder = MLPEmbedder(256, hidden_size, dtype=dtype, device=device, operations=operations)
         self.c_embedder = MLPEmbedder(text_dim, hidden_size, dtype=dtype, device=device, operations=operations)
-        self.individual_token_refiner = IndividualTokenRefiner(hidden_size, heads, num_blocks, dtype=dtype, device=device, operations=operations)
+        self.individual_token_refiner = IndividualTokenRefiner(device, operations, hidden_size, heads, num_blocks, dtype=dtype)
 
     def forward(
         self,
@@ -171,7 +172,7 @@ class TokenRefiner(nn.Module):
 
 
 class ByT5Mapper(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim, out_dim1, use_res=False, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, in_dim, out_dim, hidden_dim, out_dim1, use_res=False, dtype=None):
         super().__init__()
         self.layernorm = operations.LayerNorm(in_dim, dtype=dtype, device=device)
         self.fc1 = operations.Linear(in_dim, hidden_dim, dtype=dtype, device=device)
@@ -198,10 +199,9 @@ class HunyuanVideo(nn.Module):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, image_model=None, final_layer=True, dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, device, operations, image_model=None, final_layer=True, dtype=None, **kwargs):
         super().__init__()
         self.dtype = dtype
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
 
         params = HunyuanVideoParams(**kwargs)
         self.params = params
@@ -221,7 +221,7 @@ class HunyuanVideo(nn.Module):
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
 
-        self.img_in = comfy.ldm.modules.diffusionmodules.mmdit.PatchEmbed(None, self.patch_size, self.in_channels, self.hidden_size, conv3d=len(self.patch_size) == 3, dtype=dtype, device=device, operations=operations)
+        self.img_in = comfy.ldm.modules.diffusionmodules.mmdit.PatchEmbed(device, operations, None, self.patch_size, self.in_channels, self.hidden_size, conv3d=len(self.patch_size) == 3, dtype=dtype)
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations)
         if params.vec_in_dim is not None:
             self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
@@ -232,16 +232,17 @@ class HunyuanVideo(nn.Module):
             MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embed else nn.Identity()
         )
 
-        self.txt_in = TokenRefiner(params.context_in_dim, self.hidden_size, self.num_heads, 2, dtype=dtype, device=device, operations=operations)
+        self.txt_in = TokenRefiner(device, operations, params.context_in_dim, self.hidden_size, self.num_heads, 2, dtype=dtype)
 
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
+                    device,
                     self.hidden_size,
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
-                    dtype=dtype, device=device, operations=operations
+                    dtype=dtype, operations=operations
                 )
                 for _ in range(params.depth)
             ]
@@ -249,19 +250,21 @@ class HunyuanVideo(nn.Module):
 
         self.single_blocks = nn.ModuleList(
             [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, dtype=dtype, device=device, operations=operations)
+                SingleStreamBlock(device, self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, dtype=dtype, operations=operations)
                 for _ in range(params.depth_single_blocks)
             ]
         )
 
         if params.byt5:
             self.byt5_in = ByT5Mapper(
-                in_dim=1472,
-                out_dim=2048,
-                hidden_dim=2048,
-                out_dim1=self.hidden_size,
+                device,
+                operations,
+                1472,
+                2048,
+                2048,
+                self.hidden_size,
                 use_res=False,
-                dtype=dtype, device=device, operations=operations
+                dtype=dtype
             )
         else:
             self.byt5_in = None
@@ -277,7 +280,7 @@ class HunyuanVideo(nn.Module):
         # HunyuanVideo 1.5 specific modules
         if self.vision_in_dim is not None:
             from comfy.ldm.wan.model import MLPProj
-            self.vision_in = MLPProj(in_dim=self.vision_in_dim, out_dim=self.hidden_size, operation_settings=operation_settings)
+            self.vision_in = MLPProj(device, operations, self.vision_in_dim, self.hidden_size, dtype=dtype)
         else:
             self.vision_in = None
         if self.use_cond_type_embedding:

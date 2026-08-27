@@ -10,11 +10,11 @@ import comfy.ldm.common_dit
 import comfy.ops
 import comfy.patcher_extension
 from comfy.ldm.lightricks.model import GELU_approx, PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 class JoyImageModulate(nn.Module):
-    def __init__(self, hidden_size: int, factor: int, dtype=None, device=None):
+    def __init__(self, device, hidden_size: int, factor: int, dtype=None):
         super().__init__()
         self.factor = factor
         self.modulate_table = nn.Parameter(
@@ -31,10 +31,10 @@ class JoyImageModulate(nn.Module):
 class JoyImageFeedForward(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         inner_dim: int,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -53,17 +53,18 @@ class JoyImageFeedForward(nn.Module):
 class JoyImageAttention(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         eps: float = 1e-6,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
         inner_dim = num_attention_heads * attention_head_dim
+        self.optimized_attention = optimized_attention_for_device(device)
 
         self.img_attn_qkv = operations.Linear(dim, inner_dim * 3, bias=True, dtype=dtype, device=device)
         self.img_attn_q_norm = operations.RMSNorm(attention_head_dim, eps=eps, dtype=dtype, device=device)
@@ -118,7 +119,7 @@ class JoyImageAttention(nn.Module):
         joint_k = joint_k.flatten(2, 3)
         joint_v = joint_v.flatten(2, 3)
 
-        joint_out = optimized_attention(joint_q, joint_k, joint_v, heads=heads, transformer_options=transformer_options)
+        joint_out = self.optimized_attention(joint_q, joint_k, joint_v, heads=heads, transformer_options=transformer_options)
 
         seq_img = img.shape[1]
         img_out = joint_out[:, :seq_img, :]
@@ -132,13 +133,13 @@ class JoyImageAttention(nn.Module):
 class JoyImageTransformerBlock(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         mlp_width_ratio: float = 4.0,
         eps: float = 1e-6,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -212,12 +213,12 @@ class JoyImageTransformerBlock(nn.Module):
 class JoyImageTimeTextImageEmbedding(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         time_freq_dim: int,
         time_proj_dim: int,
         text_embed_dim: int,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()
@@ -246,6 +247,7 @@ class JoyImageTimeTextImageEmbedding(nn.Module):
 class JoyImageTransformer3DModel(nn.Module):
     def __init__(
         self,
+        device,
         patch_size: list = [1, 2, 2],
         in_channels: int = 16,
         out_channels: Optional[int] = None,
@@ -258,7 +260,6 @@ class JoyImageTransformer3DModel(nn.Module):
         theta: int = 256,
         image_model=None,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()

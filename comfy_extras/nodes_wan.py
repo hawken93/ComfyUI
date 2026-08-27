@@ -1392,8 +1392,10 @@ class WanAnimate2Cache(io.ComfyNode):
             ),
             inputs=[
                 io.Model.Input("model"),
-                io.Combo.Input("device", options=["cpu", "gpu"], default="cpu",
-                               tooltip="Where to keep the cache. cpu (RAM) is the safe choice, the cache will not fit in VRAM alongside the model at typical sizes. gpu (VRAM) can be faster if it fits."),
+                io.Combo.Input("device",
+                               options=["gpu" if o == "default" else o for o in comfy.model_management.get_gpu_device_options()],
+                               default="cpu",
+                               tooltip="Where to keep the cache. cpu (RAM) is the safe choice, the cache will not fit in VRAM alongside the model at typical sizes. gpu lets ComfyUI pick a graphics card, or pin a specific one."),
                 io.Combo.Input("dtype", options=["default", "int8", "int4"], default="default",
                                tooltip="Storage precision. default stores the activations in the model's compute dtype. int8 halves the cache, int4 quarters it, convrot is used to retain accuracy."),
             ],
@@ -1403,8 +1405,11 @@ class WanAnimate2Cache(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, device, dtype="default") -> io.NodeOutput:
-        store = comfy.model_management.get_torch_device() if device == "gpu" else torch.device("cpu")
-        cache = comfy.ldm.wan.model_animate2.PoseBranchCache(store_device=store, dtype=dtype)
+        # "gpu" here means "pick a GPU for me"; the generic option name for that is "default".
+        torch_device = comfy.model_management.pick_device_for_option("default" if device == "gpu" else device)
+        if device != "cpu" and comfy.model_management.is_device_cpu(torch_device):
+            raise ValueError("Asked for GPU but no GPU available")
+        cache = comfy.ldm.wan.model_animate2.PoseBranchCache(torch_device, dtype=dtype)
         m = model.clone()
         m.model_options["transformer_options"]["animate2_cache"] = cache
         m.add_callback(comfy.patcher_extension.CallbacksMP.ON_CLEANUP, lambda patcher: cache.free())

@@ -21,7 +21,6 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 
-import comfy.model_management
 from .base import WeightAdapterBase, WeightAdapterTrainBase
 from comfy.patcher_extension import PatcherInjection
 
@@ -174,18 +173,20 @@ class BypassForwardHook:
         h_out = self.adapter.h(x, base_out)
         return self.adapter.g(base_out + h_out)
 
-    def inject(self):
-        """Replace module forward with bypass version."""
+    def inject(self, device):
+        """Replace module forward with bypass version.
+
+        device: the model's compute device, owned by the patcher caller.
+        """
         if self.original_forward is not None:
             logging.debug(
                 f"[BypassHook] Already injected for {type(self.module).__name__}"
             )
             return  # Already injected
 
-        # Move adapter weights to compute device (GPU)
-        # Use get_torch_device() instead of module.weight.device because
-        # with offloading, module weights may be on CPU while compute happens on GPU
-        device = comfy.model_management.get_torch_device()
+        # Move adapter weights to the model's compute device instead of
+        # module.weight.device: with offloading, module weights may be on CPU
+        # while compute happens on the load device.
 
         # Get dtype from module weight if available
         dtype = None
@@ -380,7 +381,7 @@ class BypassInjectionManager:
                 f"[BypassManager] inject_all called, injecting {len(self.hooks)} hooks"
             )
             for hook in self.hooks:
-                hook.inject()
+                hook.inject(model_patcher.load_device)
                 logging.debug(
                     f"[BypassManager] Injected hook for {type(hook.module).__name__}"
                 )

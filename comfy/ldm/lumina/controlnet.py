@@ -6,6 +6,8 @@ from .model import JointTransformerBlock
 class ZImageControlTransformerBlock(JointTransformerBlock):
     def __init__(
         self,
+        device,
+        operations,
         layer_id: int,
         dim: int,
         n_heads: int,
@@ -16,13 +18,13 @@ class ZImageControlTransformerBlock(JointTransformerBlock):
         qk_norm: bool,
         modulation=True,
         block_id=0,
-        operation_settings=None,
+        dtype=None,
     ):
-        super().__init__(layer_id, dim, n_heads, n_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, qk_norm, modulation, z_image_modulation=True, operation_settings=operation_settings)
+        super().__init__(device, operations, layer_id, dim, n_heads, n_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, qk_norm, modulation, z_image_modulation=True, dtype=dtype)
         self.block_id = block_id
         if block_id == 0:
-            self.before_proj = operation_settings.get("operations").Linear(self.dim, self.dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.after_proj = operation_settings.get("operations").Linear(self.dim, self.dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+            self.before_proj = operations.Linear(self.dim, self.dim, device=device, dtype=dtype)
+        self.after_proj = operations.Linear(self.dim, self.dim, device=device, dtype=dtype)
 
     def forward(self, c, x, **kwargs):
         if self.block_id == 0:
@@ -34,6 +36,8 @@ class ZImageControlTransformerBlock(JointTransformerBlock):
 class ZImage_Control(torch.nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int = 3840,
         n_heads: int = 30,
         n_kv_heads: int = 30,
@@ -47,12 +51,9 @@ class ZImage_Control(torch.nn.Module):
         broken=False,
         refiner_control=False,
         dtype=None,
-        device=None,
-        operations=None,
         **kwargs
     ):
         super().__init__()
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
 
         self.broken = broken
         self.additional_in_dim = additional_in_dim
@@ -62,6 +63,8 @@ class ZImage_Control(torch.nn.Module):
         self.control_layers = nn.ModuleList(
             [
                 ZImageControlTransformerBlock(
+                    device,
+                    operations,
                     i,
                     dim,
                     n_heads,
@@ -71,7 +74,7 @@ class ZImage_Control(torch.nn.Module):
                     norm_eps,
                     qk_norm,
                     block_id=i,
-                    operation_settings=operation_settings,
+                    dtype=dtype,
                 )
                 for i in range(self.n_control_layers)
             ]
@@ -90,6 +93,8 @@ class ZImage_Control(torch.nn.Module):
             self.control_noise_refiner = nn.ModuleList(
                 [
                     ZImageControlTransformerBlock(
+                        device,
+                        operations,
                         layer_id,
                         dim,
                         n_heads,
@@ -99,7 +104,7 @@ class ZImage_Control(torch.nn.Module):
                         norm_eps,
                         qk_norm,
                         block_id=layer_id,
-                        operation_settings=operation_settings,
+                        dtype=dtype,
                     )
                     for layer_id in range(n_refiner_layers)
                 ]
@@ -108,6 +113,8 @@ class ZImage_Control(torch.nn.Module):
             self.control_noise_refiner = nn.ModuleList(
                 [
                     JointTransformerBlock(
+                        device,
+                        operations,
                         layer_id,
                         dim,
                         n_heads,
@@ -118,7 +125,7 @@ class ZImage_Control(torch.nn.Module):
                         qk_norm,
                         modulation=True,
                         z_image_modulation=True,
-                        operation_settings=operation_settings,
+                        dtype=dtype,
                     )
                     for layer_id in range(n_refiner_layers)
                 ]

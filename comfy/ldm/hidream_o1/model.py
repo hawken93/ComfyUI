@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 import comfy.patcher_extension
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.modules.diffusionmodules.mmdit import TimestepEmbedder
 from comfy.text_encoders.llama import Llama2_
 from comfy.text_encoders.qwen35 import Qwen35VisionModel
@@ -93,7 +94,7 @@ class FinalLayer(nn.Module):
 class HiDreamO1Transformer(nn.Module):
     """HiDream-O1 unified pixel-level transformer."""
 
-    def __init__(self, image_model=None, dtype=None, device=None, operations=None,
+    def __init__(self, device, image_model=None, dtype=None, operations=None,
                  text_config_overrides=None, vision_config_overrides=None, **kwargs):
         super().__init__()
         self.dtype = dtype
@@ -114,7 +115,7 @@ class HiDreamO1Transformer(nn.Module):
         self.visual = Qwen35VisionModel(vision_cfg, device=device, dtype=dtype, ops=operations)
         self.language_model = Llama2_(text_cfg, device=device, dtype=dtype, ops=operations)
         self.t_embedder1 = TimestepEmbedder(
-            text_cfg.hidden_size, device=device, dtype=dtype, operations=operations,
+            device, operations, text_cfg.hidden_size, dtype=dtype,
         )
         self.x_embedder = BottleneckPatchEmbed(
             patch_size=self.patch_size, in_chans=self.in_channels,
@@ -125,6 +126,11 @@ class HiDreamO1Transformer(nn.Module):
             text_cfg.hidden_size, patch_size=self.patch_size,
             out_channels=self.in_channels, device=device, dtype=dtype, ops=operations,
         )
+
+        # Per-device attention backend, resolved once at init (replaces the deleted
+        # module-level optimized_attention global). ar_len/transformer_options vary
+        # per step and are supplied when the callable is built in _forward.
+        self.optimized_attention = optimized_attention_for_device(device)
 
         self._visual_cache = None
         self._kv_cache_entries = []
@@ -197,7 +203,7 @@ class HiDreamO1Transformer(nn.Module):
         freqs_cis = self.language_model.compute_freqs_cis(position_ids[0].to(x.device), x.device)
         freqs_cis = tuple(t.to(x.dtype) for t in freqs_cis)
 
-        two_pass_attn = make_two_pass_attention(ar_len, transformer_options=transformer_options)
+        two_pass_attn = make_two_pass_attention(ar_len, self.optimized_attention, transformer_options=transformer_options)
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.language_model.layers)

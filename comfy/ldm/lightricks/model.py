@@ -1033,6 +1033,7 @@ class LTXVModel(LTXBaseModel):
 
     def __init__(
         self,
+        device,
         in_channels=128,
         cross_attention_dim=2048,
         attention_head_dim=64,
@@ -1048,7 +1049,6 @@ class LTXVModel(LTXBaseModel):
         caption_proj_before_connector=False,
         cross_attention_adaln=False,
         dtype=None,
-        device=None,
         operations=None,
         **kwargs,
     ):

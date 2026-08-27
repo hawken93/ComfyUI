@@ -13,6 +13,7 @@ import comfy.patcher_extension
 class Hunyuan3Dv2(nn.Module):
     def __init__(
         self,
+        device,
         in_channels=64,
         context_in_dim=1536,
         hidden_size=1024,
@@ -24,7 +25,6 @@ class Hunyuan3Dv2(nn.Module):
         guidance_embed=False,
         image_model=None,
         dtype=None,
-        device=None,
         operations=None
     ):
         super().__init__()
@@ -45,11 +45,12 @@ class Hunyuan3Dv2(nn.Module):
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
+                    device,
                     hidden_size,
                     num_heads,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
-                    dtype=dtype, device=device, operations=operations
+                    dtype=dtype, operations=operations
                 )
                 for _ in range(depth)
             ]
@@ -57,10 +58,11 @@ class Hunyuan3Dv2(nn.Module):
         self.single_blocks = nn.ModuleList(
             [
                 SingleStreamBlock(
+                    device,
                     hidden_size,
                     num_heads,
                     mlp_ratio=mlp_ratio,
-                    dtype=dtype, device=device, operations=operations
+                    dtype=dtype, operations=operations
                 )
                 for _ in range(depth_single_blocks)
             ]

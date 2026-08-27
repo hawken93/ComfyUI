@@ -6,6 +6,7 @@ import torch
 from itertools import accumulate, chain
 from comfy.ldm.modules.diffusionmodules.model import get_timestep_embedding
 from comfy.ldm.seedvr.attention import optimized_var_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from torch.nn.modules.utils import _triple
 from torch import nn
 import math
@@ -533,6 +534,7 @@ class NaMMAttention(nn.Module):
         super().__init__()
         dim = MMArg(vid_dim, txt_dim)
         self.heads = heads
+        self.optimized_attention = optimized_attention_for_device(device)
         inner_dim = heads * head_dim
         qkv_dim = inner_dim * 3
         self.head_dim = head_dim
@@ -684,6 +686,7 @@ class NaSwinAttention(NaMMAttention):
             "mm_pnp", lambda: repeat_concat_idx(vid_len_win, txt_len, window_count)
         )
         out = optimized_var_attention(
+            self.optimized_attention,
             q=concat_win(vid_q, txt_q),
             k=concat_win(vid_k, txt_k),
             v=concat_win(vid_v, txt_v),
@@ -1120,6 +1123,7 @@ class NaDiT(nn.Module):
 
     def __init__(
         self,
+        device,
         norm_eps,
         num_layers,
         mlp_type,
@@ -1137,7 +1141,6 @@ class NaDiT(nn.Module):
         rope_type = "mmrope3d",
         vid_out_norm: Optional[str] = None,
         image_model = None,
-        device = None,
         dtype = None,
         operations = None,
     ):

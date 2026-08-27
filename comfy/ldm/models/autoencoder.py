@@ -13,7 +13,7 @@ from einops import rearrange
 import comfy.model_management
 
 class DiagonalGaussianRegularizer(torch.nn.Module):
-    def __init__(self, sample: bool = False):
+    def __init__(self, device, sample: bool = False):
         super().__init__()
         self.sample = sample
 
@@ -29,7 +29,7 @@ class DiagonalGaussianRegularizer(torch.nn.Module):
         return z, None
 
 class EmptyRegularizer(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super().__init__()
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, dict]:
@@ -108,6 +108,7 @@ class AutoencodingEngine(AbstractAutoencoder):
 
     def __init__(
         self,
+        device,
         *args,
         encoder_config: Dict,
         decoder_config: Dict,
@@ -116,11 +117,9 @@ class AutoencodingEngine(AbstractAutoencoder):
     ):
         super().__init__(*args, **kwargs)
 
-        self.encoder: torch.nn.Module = instantiate_from_config(encoder_config)
-        self.decoder: torch.nn.Module = instantiate_from_config(decoder_config)
-        self.regularization = instantiate_from_config(
-            regularizer_config
-        )
+        self.encoder: torch.nn.Module = instantiate_from_config(device, encoder_config)
+        self.decoder: torch.nn.Module = instantiate_from_config(device, decoder_config)
+        self.regularization = instantiate_from_config(device, regularizer_config)
 
     def get_last_layer(self):
         return self.decoder.get_last_layer()
@@ -152,11 +151,12 @@ class AutoencodingEngine(AbstractAutoencoder):
 
 
 class AutoencodingEngineLegacy(AutoencodingEngine):
-    def __init__(self, embed_dim: int, **kwargs):
+    def __init__(self, device, embed_dim: int, **kwargs):
         self.max_batch_size = kwargs.pop("max_batch_size", None)
         ddconfig = kwargs.pop("ddconfig")
         decoder_ddconfig = kwargs.pop("decoder_ddconfig", ddconfig)
         super().__init__(
+            device,
             encoder_config={
                 "target": "comfy.ldm.modules.diffusionmodules.model.Encoder",
                 "params": ddconfig,
@@ -267,10 +267,11 @@ class AutoencodingEngineLegacy(AutoencodingEngine):
 
 
 class AutoencoderKL(AutoencodingEngineLegacy):
-    def __init__(self, **kwargs):
+    def __init__(self, device, **kwargs):
         if "lossconfig" in kwargs:
             kwargs["loss_config"] = kwargs.pop("lossconfig")
         super().__init__(
+            device,
             regularizer_config={
                 "target": (
                     "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"

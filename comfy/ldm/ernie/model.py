@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 import comfy.ops
 import comfy.quant_ops
@@ -42,7 +42,7 @@ class ErnieImageEmbedND3(nn.Module):
         return rot.reshape(*rot.shape[:-1], 2, 2).unsqueeze(2)
 
 class ErnieImagePatchEmbedDynamic(nn.Module):
-    def __init__(self, in_channels: int, embed_dim: int, patch_size: int, operations, device=None, dtype=None):
+    def __init__(self, in_channels: int, embed_dim: int, patch_size: int, operations, device, dtype=None):
         super().__init__()
         self.patch_size = patch_size
         self.proj = operations.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True, device=device, dtype=dtype)
@@ -70,7 +70,7 @@ class Timesteps(nn.Module):
         return emb
 
 class TimestepEmbedding(nn.Module):
-    def __init__(self, in_channels: int, time_embed_dim: int, operations, device=None, dtype=None):
+    def __init__(self, in_channels: int, time_embed_dim: int, operations, device, dtype=None):
         super().__init__()
         Linear = operations.Linear
         self.linear_1 = Linear(in_channels, time_embed_dim, bias=True, device=device, dtype=dtype)
@@ -84,7 +84,7 @@ class TimestepEmbedding(nn.Module):
         return sample
 
 class ErnieImageAttention(nn.Module):
-    def __init__(self, query_dim: int, heads: int, dim_head: int, eps: float = 1e-6, operations=None, device=None, dtype=None):
+    def __init__(self, query_dim: int, heads: int, dim_head: int, device, eps: float = 1e-6, operations=None, dtype=None):
         super().__init__()
         self.heads = heads
         self.head_dim = dim_head
@@ -101,6 +101,8 @@ class ErnieImageAttention(nn.Module):
         self.norm_k = RMSNorm(dim_head, eps=eps, elementwise_affine=True, device=device, dtype=dtype)
 
         self.to_out = nn.ModuleList([Linear(self.inner_dim, query_dim, bias=False, device=device, dtype=dtype)])
+
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None, image_rotary_emb: torch.Tensor = None) -> torch.Tensor:
         B, S, _ = x.shape
@@ -127,12 +129,12 @@ class ErnieImageAttention(nn.Module):
         q_flat = query.reshape(B, S, -1)
         k_flat = key.reshape(B, S, -1)
 
-        hidden_states = optimized_attention(q_flat, k_flat, v_flat, self.heads, mask=attention_mask)
+        hidden_states = self.optimized_attention(q_flat, k_flat, v_flat, self.heads, mask=attention_mask)
 
         return self.to_out[0](hidden_states)
 
 class ErnieImageFeedForward(nn.Module):
-    def __init__(self, hidden_size: int, ffn_hidden_size: int, operations, device=None, dtype=None):
+    def __init__(self, hidden_size: int, ffn_hidden_size: int, operations, device, dtype=None):
         super().__init__()
         Linear = operations.Linear
         self.gate_proj = Linear(hidden_size, ffn_hidden_size, bias=False, device=device, dtype=dtype)
@@ -143,7 +145,7 @@ class ErnieImageFeedForward(nn.Module):
         return self.linear_fc2(self.up_proj(x) * F.gelu(self.gate_proj(x)))
 
 class ErnieImageSharedAdaLNBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, ffn_hidden_size: int, eps: float = 1e-6, operations=None, device=None, dtype=None):
+    def __init__(self, hidden_size: int, num_heads: int, ffn_hidden_size: int, device, eps: float = 1e-6, operations=None, dtype=None):
         super().__init__()
         RMSNorm = operations.RMSNorm
 
@@ -177,7 +179,7 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         return residual + gate_mlp * self.mlp(x_norm)
 
 class ErnieImageAdaLNContinuous(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6, operations=None, device=None, dtype=None):
+    def __init__(self, hidden_size: int, device, eps: float = 1e-6, operations=None, dtype=None):
         super().__init__()
         LayerNorm = operations.LayerNorm
         Linear = operations.Linear
@@ -193,6 +195,7 @@ class ErnieImageAdaLNContinuous(nn.Module):
 class ErnieImageModel(nn.Module):
     def __init__(
         self,
+        device,
         hidden_size: int = 4096,
         num_attention_heads: int = 32,
         num_layers: int = 36,
@@ -205,7 +208,6 @@ class ErnieImageModel(nn.Module):
         rope_axes_dim: tuple = (32, 48, 48),
         eps: float = 1e-6,
         qk_layernorm: bool = True,
-        device=None,
         dtype=None,
         operations=None,
         **kwargs
@@ -234,11 +236,11 @@ class ErnieImageModel(nn.Module):
         )
 
         self.layers = nn.ModuleList([
-            ErnieImageSharedAdaLNBlock(hidden_size, num_attention_heads, ffn_hidden_size, eps, operations, device, dtype)
+            ErnieImageSharedAdaLNBlock(hidden_size, num_attention_heads, ffn_hidden_size, device, eps, operations, dtype)
             for _ in range(num_layers)
         ])
 
-        self.final_norm = ErnieImageAdaLNContinuous(hidden_size, eps, operations, device, dtype)
+        self.final_norm = ErnieImageAdaLNContinuous(hidden_size, device, eps, operations, dtype)
         self.final_linear = Linear(hidden_size, patch_size * patch_size * out_channels, device=device, dtype=dtype)
 
     def forward(self, x, timesteps, context, **kwargs):

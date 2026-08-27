@@ -1,4 +1,5 @@
 import pytest
+import sys
 import time
 import torch
 import urllib.error
@@ -18,7 +19,7 @@ class TestAsyncNodes:
     ])
     def _server(self, args_pytest, request):
         pargs = [
-            'python','main.py',
+            sys.executable, 'main.py',
             '--output-directory', args_pytest["output_dir"],
             '--listen', args_pytest["listen"],
             '--port', str(args_pytest["port"]),

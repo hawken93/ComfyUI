@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from typing import Optional
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.ops
 
 class WhisperFeatureExtractor(nn.Module):
-    def __init__(self, n_mels=128, device=None):
+    def __init__(self, device, n_mels=128):
         super().__init__()
         self.sample_rate = 16000
         self.n_fft = 400
@@ -52,13 +52,14 @@ class WhisperFeatureExtractor(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, d_model: int, n_heads: int, dtype=None):
         super().__init__()
         assert d_model % n_heads == 0
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        self.optimized_attention = optimized_attention_for_device(device, need_mask=True)
 
         self.q_proj = operations.Linear(d_model, d_model, dtype=dtype, device=device)
         self.k_proj = operations.Linear(d_model, d_model, bias=False, dtype=dtype, device=device)
@@ -78,17 +79,17 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(key)
         v = self.v_proj(value)
 
-        attn_output = optimized_attention_masked(q, k, v, self.n_heads, mask)
+        attn_output = self.optimized_attention(q, k, v, self.n_heads, mask)
         attn_output = self.out_proj(attn_output)
 
         return attn_output
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, d_model: int, n_heads: int, d_ff: int, dtype=None):
         super().__init__()
 
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dtype=dtype, device=device, operations=operations)
+        self.self_attn = MultiHeadAttention(device, operations, d_model, n_heads, dtype=dtype)
         self.self_attn_layer_norm = operations.LayerNorm(d_model, dtype=dtype, device=device)
 
         self.fc1 = operations.Linear(d_model, d_ff, dtype=dtype, device=device)
@@ -118,14 +119,14 @@ class EncoderLayer(nn.Module):
 class AudioEncoder(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         n_mels: int = 128,
         n_ctx: int = 1500,
         n_state: int = 1280,
         n_head: int = 20,
         n_layer: int = 32,
-        dtype=None,
-        device=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
 
@@ -135,7 +136,7 @@ class AudioEncoder(nn.Module):
         self.embed_positions = operations.Embedding(n_ctx, n_state, dtype=dtype, device=device)
 
         self.layers = nn.ModuleList([
-            EncoderLayer(n_state, n_head, n_state * 4, dtype=dtype, device=device, operations=operations)
+            EncoderLayer(device, operations, n_state, n_head, n_state * 4, dtype=dtype)
             for _ in range(n_layer)
         ])
 
@@ -162,22 +163,23 @@ class AudioEncoder(nn.Module):
 class WhisperLargeV3(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         n_mels: int = 128,
         n_audio_ctx: int = 1500,
         n_audio_state: int = 1280,
         n_audio_head: int = 20,
         n_audio_layer: int = 32,
-        dtype=None,
-        device=None,
-        operations=None
+        dtype=None
     ):
         super().__init__()
 
-        self.feature_extractor = WhisperFeatureExtractor(n_mels=n_mels, device=device)
+        self.feature_extractor = WhisperFeatureExtractor(device, n_mels=n_mels)
 
         self.encoder = AudioEncoder(
+            device, operations,
             n_mels, n_audio_ctx, n_audio_state, n_audio_head, n_audio_layer,
-            dtype=dtype, device=device, operations=operations
+            dtype=dtype
         )
 
     def forward(self, audio):

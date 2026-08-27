@@ -134,7 +134,7 @@ class UpSmpl(nn.Module):
         return h + x
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels, z_channels, block_out_channels, num_res_blocks,
+    def __init__(self, device, in_channels, z_channels, block_out_channels, num_res_blocks,
                  ffactor_spatial, ffactor_temporal, downsample_match_channel=True, refiner_vae=True, **_):
         super().__init__()
         self.z_channels = z_channels
@@ -179,7 +179,7 @@ class Encoder(nn.Module):
         self.norm_out = norm_op(ch)
         self.conv_out = conv_op(ch, z_channels << 1, 3, 1, 1)
 
-        self.regul = comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer()
+        self.regul = comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer(device)
 
     def forward(self, x):
         if not self.refiner_vae and x.shape[2] == 1:
@@ -230,9 +230,11 @@ class Encoder(nn.Module):
         return out
 
 class Decoder(nn.Module):
-    def __init__(self, z_channels, out_channels, block_out_channels, num_res_blocks,
+    def __init__(self, device, z_channels, out_channels, block_out_channels, num_res_blocks,
                  ffactor_spatial, ffactor_temporal, upsample_match_channel=True, refiner_vae=True, **_):
         super().__init__()
+        # TODO device required but not used once; Should probably
+        # update a bunch of the callees here so that they utilize device and dtype
         block_out_channels = block_out_channels[::-1]
         self.z_channels = z_channels
         self.block_out_channels = block_out_channels

@@ -5,19 +5,19 @@ from einops import rearrange
 import torch.nn.functional as F
 import math
 from .model import WanModel, sinusoidal_embedding_1d
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
 
 class CausalConv1d(nn.Module):
 
-    def __init__(self, chan_in, chan_out, kernel_size=3, stride=1, dilation=1, pad_mode="replicate", operations=None, **kwargs):
+    def __init__(self, device, operations, chan_in, chan_out, kernel_size=3, stride=1, dilation=1, pad_mode="replicate", dtype=None):
         super().__init__()
 
         self.pad_mode = pad_mode
         padding = (kernel_size - 1, 0)  # T
         self.time_causal_padding = padding
 
-        self.conv = operations.Conv1d(chan_in, chan_out, kernel_size, stride=stride, dilation=dilation, **kwargs)
+        self.conv = operations.Conv1d(chan_in, chan_out, kernel_size, stride=stride, dilation=dilation, device=device, dtype=dtype)
 
     def forward(self, x):
         x = F.pad(x, self.time_causal_padding, mode=self.pad_mode)
@@ -25,25 +25,24 @@ class CausalConv1d(nn.Module):
 
 
 class FaceEncoder(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, num_heads=int, dtype=None, device=None, operations=None):
-        factory_kwargs = {"dtype": dtype, "device": device}
+    def __init__(self, device, operations, in_dim: int, hidden_dim: int, num_heads: int, dtype=None):
         super().__init__()
 
         self.num_heads = num_heads
-        self.conv1_local = CausalConv1d(in_dim, 1024 * num_heads, 3, stride=1, operations=operations, **factory_kwargs)
-        self.norm1 = operations.LayerNorm(hidden_dim // 8, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.conv1_local = CausalConv1d(device, operations, in_dim, 1024 * num_heads, 3, stride=1, dtype=dtype)
+        self.norm1 = operations.LayerNorm(hidden_dim // 8, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
         self.act = nn.SiLU()
-        self.conv2 = CausalConv1d(1024, 1024, 3, stride=2, operations=operations, **factory_kwargs)
-        self.conv3 = CausalConv1d(1024, 1024, 3, stride=2, operations=operations, **factory_kwargs)
+        self.conv2 = CausalConv1d(device, operations, 1024, 1024, 3, stride=2, dtype=dtype)
+        self.conv3 = CausalConv1d(device, operations, 1024, 1024, 3, stride=2, dtype=dtype)
 
-        self.out_proj = operations.Linear(1024, hidden_dim, **factory_kwargs)
-        self.norm1 = operations.LayerNorm(1024, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.out_proj = operations.Linear(1024, hidden_dim, device=device, dtype=dtype)
+        self.norm1 = operations.LayerNorm(1024, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
 
-        self.norm2 = operations.LayerNorm(1024, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.norm2 = operations.LayerNorm(1024, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
 
-        self.norm3 = operations.LayerNorm(1024, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.norm3 = operations.LayerNorm(1024, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
 
-        self.padding_tokens = nn.Parameter(torch.empty(1, 1, 1, hidden_dim, **factory_kwargs))
+        self.padding_tokens = nn.Parameter(torch.empty(1, 1, 1, hidden_dim, device=device, dtype=dtype))
 
     def forward(self, x):
 
@@ -74,7 +73,7 @@ class FaceEncoder(nn.Module):
         return x_local
 
 
-def get_norm_layer(norm_layer, operations=None):
+def get_norm_layer(norm_layer, operations):
     """
     Get the normalization layer.
 
@@ -95,27 +94,28 @@ def get_norm_layer(norm_layer, operations=None):
 class FaceAdapter(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         hidden_dim: int,
         heads_num: int,
         qk_norm: bool = True,
         qk_norm_type: str = "rms",
         num_adapter_layers: int = 1,
-        dtype=None, device=None, operations=None
+        dtype=None
     ):
 
-        factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.hidden_size = hidden_dim
         self.heads_num = heads_num
         self.fuser_blocks = nn.ModuleList(
             [
                 FaceBlock(
+                    device, operations,
                     self.hidden_size,
                     self.heads_num,
-                    qk_norm=qk_norm,
-                    qk_norm_type=qk_norm_type,
-                    operations=operations,
-                    **factory_kwargs,
+                    qk_norm,
+                    qk_norm_type,
+                    dtype=dtype,
                 )
                 for _ in range(num_adapter_layers)
             ]
@@ -137,16 +137,15 @@ class FaceAdapter(nn.Module):
 class FaceBlock(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         hidden_size: int,
         heads_num: int,
         qk_norm: bool = True,
         qk_norm_type: str = "rms",
         qk_scale: float = None,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        operations=None
+        dtype=None
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
         self.deterministic = False
@@ -154,23 +153,24 @@ class FaceBlock(nn.Module):
         self.heads_num = heads_num
         head_dim = hidden_size // heads_num
         self.scale = qk_scale or head_dim**-0.5
+        self.optimized_attention = optimized_attention_for_device(device)
 
-        self.linear1_kv = operations.Linear(hidden_size, hidden_size * 2, **factory_kwargs)
-        self.linear1_q = operations.Linear(hidden_size, hidden_size, **factory_kwargs)
+        self.linear1_kv = operations.Linear(hidden_size, hidden_size * 2, device=device, dtype=dtype)
+        self.linear1_q = operations.Linear(hidden_size, hidden_size, device=device, dtype=dtype)
 
-        self.linear2 = operations.Linear(hidden_size, hidden_size, **factory_kwargs)
+        self.linear2 = operations.Linear(hidden_size, hidden_size, device=device, dtype=dtype)
 
-        qk_norm_layer = get_norm_layer(qk_norm_type, operations=operations)
+        qk_norm_layer = get_norm_layer(qk_norm_type, operations)
         self.q_norm = (
-            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, device=device, dtype=dtype) if qk_norm else nn.Identity()
         )
         self.k_norm = (
-            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, device=device, dtype=dtype) if qk_norm else nn.Identity()
         )
 
-        self.pre_norm_feat = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.pre_norm_feat = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
 
-        self.pre_norm_motion = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.pre_norm_motion = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, device=device, dtype=dtype)
 
     def forward(
         self,
@@ -201,7 +201,7 @@ class FaceBlock(nn.Module):
 
         q = rearrange(q, "B (L S) H D -> (B L) S (H D)", L=T_comp)
 
-        attn = optimized_attention(q, k, v, heads=self.heads_num)
+        attn = self.optimized_attention(q, k, v, heads=self.heads_num)
 
         attn = rearrange(attn, "(B L) S C -> B (L S) C", L=T_comp)
 
@@ -235,7 +235,7 @@ def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
 
 # https://github.com/XPixelGroup/BasicSR/blob/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a/basicsr/ops/fused_act/fused_act.py#L81
 class FusedLeakyReLU(torch.nn.Module):
-    def __init__(self, channel, negative_slope=0.2, scale=2 ** 0.5, dtype=None, device=None):
+    def __init__(self, device, channel, negative_slope=0.2, scale=2 ** 0.5, dtype=None):
         super().__init__()
         self.bias = torch.nn.Parameter(torch.empty(1, channel, 1, 1, dtype=dtype, device=device))
         self.negative_slope = negative_slope
@@ -248,7 +248,7 @@ def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
     return F.leaky_relu(input + bias, negative_slope) * scale
 
 class Blur(torch.nn.Module):
-    def __init__(self, kernel, pad, dtype=None, device=None):
+    def __init__(self, device, kernel, pad, dtype=None):
         super().__init__()
         kernel = torch.tensor(kernel, dtype=dtype, device=device)
         kernel = kernel[None, :] * kernel[:, None]
@@ -270,7 +270,7 @@ class ScaledLeakyReLU(torch.nn.Module):
 
 # https://github.com/XPixelGroup/BasicSR/blob/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a/basicsr/archs/stylegan2_arch.py#L605
 class EqualConv2d(torch.nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True, dtype=None):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.empty(out_channel, in_channel, kernel_size, kernel_size, device=device, dtype=dtype))
         self.scale = 1 / math.sqrt(in_channel * kernel_size ** 2)
@@ -288,7 +288,7 @@ class EqualConv2d(torch.nn.Module):
 
 # https://github.com/XPixelGroup/BasicSR/blob/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a/basicsr/archs/stylegan2_arch.py#L134
 class EqualLinear(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None, dtype=None, device=None, operations=None):
+    def __init__(self, device, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None, dtype=None):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.empty(out_dim, in_dim, device=device, dtype=dtype))
         self.bias = torch.nn.Parameter(torch.empty(out_dim, device=device, dtype=dtype)) if bias else None
@@ -309,31 +309,31 @@ class EqualLinear(torch.nn.Module):
 
 # https://github.com/XPixelGroup/BasicSR/blob/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a/basicsr/archs/stylegan2_arch.py#L654
 class ConvLayer(torch.nn.Sequential):
-    def __init__(self, in_channel, out_channel, kernel_size, downsample=False, blur_kernel=[1, 3, 3, 1], bias=True, activate=True, dtype=None, device=None, operations=None):
+    def __init__(self, device, in_channel, out_channel, kernel_size, downsample=False, blur_kernel=[1, 3, 3, 1], bias=True, activate=True, dtype=None):
         layers = []
 
         if downsample:
             factor = 2
             p = (len(blur_kernel) - factor) + (kernel_size - 1)
-            layers.append(Blur(blur_kernel, pad=((p + 1) // 2, p // 2)))
+            layers.append(Blur(device, blur_kernel, ((p + 1) // 2, p // 2), dtype=dtype))
             stride, padding = 2, 0
         else:
             stride, padding = 1, kernel_size // 2
 
-        layers.append(EqualConv2d(in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias and not activate, dtype=dtype, device=device, operations=operations))
+        layers.append(EqualConv2d(device, in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias and not activate, dtype=dtype))
 
         if activate:
-            layers.append(FusedLeakyReLU(out_channel) if bias else ScaledLeakyReLU(0.2))
+            layers.append(FusedLeakyReLU(device, out_channel, dtype=dtype) if bias else ScaledLeakyReLU(0.2))
 
         super().__init__(*layers)
 
 # https://github.com/XPixelGroup/BasicSR/blob/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a/basicsr/archs/stylegan2_arch.py#L704
 class ResBlock(torch.nn.Module):
-    def __init__(self, in_channel, out_channel, dtype=None, device=None, operations=None):
+    def __init__(self, device, in_channel, out_channel, dtype=None):
         super().__init__()
-        self.conv1 = ConvLayer(in_channel, in_channel, 3, dtype=dtype, device=device, operations=operations)
-        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True, dtype=dtype, device=device, operations=operations)
-        self.skip = ConvLayer(in_channel, out_channel, 1, downsample=True, activate=False, bias=False, dtype=dtype, device=device, operations=operations)
+        self.conv1 = ConvLayer(device, in_channel, in_channel, 3, dtype=dtype)
+        self.conv2 = ConvLayer(device, in_channel, out_channel, 3, downsample=True, dtype=dtype)
+        self.skip = ConvLayer(device, in_channel, out_channel, 1, downsample=True, activate=False, bias=False, dtype=dtype)
 
     def forward(self, input):
         out = self.conv2(self.conv1(input))
@@ -342,16 +342,19 @@ class ResBlock(torch.nn.Module):
 
 
 class EncoderApp(torch.nn.Module):
-    def __init__(self, w_dim=512, dtype=None, device=None, operations=None):
+    def __init__(self, device, w_dim=512, dtype=None):
         super().__init__()
-        kwargs = {"device": device, "dtype": dtype, "operations": operations}
 
         self.convs = torch.nn.ModuleList([
-            ConvLayer(3, 32, 1, **kwargs), ResBlock(32, 64, **kwargs),
-            ResBlock(64, 128, **kwargs), ResBlock(128, 256, **kwargs),
-            ResBlock(256, 512, **kwargs), ResBlock(512, 512, **kwargs),
-            ResBlock(512, 512, **kwargs), ResBlock(512, 512, **kwargs),
-            EqualConv2d(512, w_dim, 4, padding=0, bias=False, **kwargs)
+            ConvLayer(device, 3, 32, 1, dtype=dtype),
+            ResBlock(device, 32, 64, dtype=dtype),
+            ResBlock(device, 64, 128, dtype=dtype),
+            ResBlock(device, 128, 256, dtype=dtype),
+            ResBlock(device, 256, 512, dtype=dtype),
+            ResBlock(device, 512, 512, dtype=dtype),
+            ResBlock(device, 512, 512, dtype=dtype),
+            ResBlock(device, 512, 512, dtype=dtype),
+            EqualConv2d(device, 512, w_dim, 4, padding=0, bias=False, dtype=dtype)
         ])
 
     def forward(self, x):
@@ -361,16 +364,16 @@ class EncoderApp(torch.nn.Module):
         return h.squeeze(-1).squeeze(-1)
 
 class Encoder(torch.nn.Module):
-    def __init__(self, dim=512, motion_dim=20, dtype=None, device=None, operations=None):
+    def __init__(self, device, dim=512, motion_dim=20, dtype=None):
         super().__init__()
-        self.net_app = EncoderApp(dim, dtype=dtype, device=device, operations=operations)
-        self.fc = torch.nn.Sequential(*[EqualLinear(dim, dim, dtype=dtype, device=device, operations=operations) for _ in range(4)] + [EqualLinear(dim, motion_dim, dtype=dtype, device=device, operations=operations)])
+        self.net_app = EncoderApp(device, w_dim=dim, dtype=dtype)
+        self.fc = torch.nn.Sequential(*[EqualLinear(device, dim, dim, dtype=dtype) for _ in range(4)] + [EqualLinear(device, dim, motion_dim, dtype=dtype)])
 
     def encode_motion(self, x):
         return self.fc(self.net_app(x))
 
 class Direction(torch.nn.Module):
-    def __init__(self, motion_dim, dtype=None, device=None, operations=None):
+    def __init__(self, device, motion_dim, dtype=None):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.empty(512, motion_dim, device=device, dtype=dtype))
         self.motion_dim = motion_dim
@@ -383,15 +386,15 @@ class Direction(torch.nn.Module):
         return torch.sum(input.unsqueeze(-1) * Q.T.to(input.dtype), dim=1)
 
 class Synthesis(torch.nn.Module):
-    def __init__(self, motion_dim, dtype=None, device=None, operations=None):
+    def __init__(self, device, motion_dim, dtype=None):
         super().__init__()
-        self.direction = Direction(motion_dim, dtype=dtype, device=device, operations=operations)
+        self.direction = Direction(device, motion_dim, dtype=dtype)
 
 class Generator(torch.nn.Module):
-    def __init__(self, style_dim=512, motion_dim=20, dtype=None, device=None, operations=None):
+    def __init__(self, device, style_dim=512, motion_dim=20, dtype=None):
         super().__init__()
-        self.enc = Encoder(style_dim, motion_dim, dtype=dtype, device=device, operations=operations)
-        self.dec = Synthesis(motion_dim, dtype=dtype, device=device, operations=operations)
+        self.enc = Encoder(device, dim=style_dim, motion_dim=motion_dim, dtype=dtype)
+        self.dec = Synthesis(device, motion_dim, dtype=dtype)
 
     def get_motion(self, img):
         motion_feat = self.enc.encode_motion(img)
@@ -403,6 +406,8 @@ class AnimateWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
+                 operations,
                  model_type='animate',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -421,31 +426,31 @@ class AnimateWanModel(WanModel):
                  flf_pos_embed_token_number=None,
                  motion_encoder_dim=512,
                  image_model=None,
-                 device=None,
                  dtype=None,
-                 operations=None,
                  ):
 
-        super().__init__(model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, image_model=image_model, device=device, dtype=dtype, operations=operations)
+        super().__init__(device, operations, model_type='i2v', patch_size=patch_size, text_len=text_len, in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim, text_dim=text_dim, out_dim=out_dim, num_heads=num_heads, num_layers=num_layers, window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps, flf_pos_embed_token_number=flf_pos_embed_token_number, image_model=image_model, dtype=dtype)
 
         self.pose_patch_embedding = operations.Conv3d(
             16, dim, kernel_size=patch_size, stride=patch_size, device=device, dtype=dtype
         )
 
-        self.motion_encoder = Generator(style_dim=512, motion_dim=20, device=device, dtype=dtype, operations=operations)
+        self.motion_encoder = Generator(device, style_dim=512, motion_dim=20, dtype=dtype)
 
         self.face_adapter = FaceAdapter(
-            heads_num=self.num_heads,
-            hidden_dim=self.dim,
+            device, operations,
+            self.dim,
+            self.num_heads,
             num_adapter_layers=self.num_layers // 5,
-            device=device, dtype=dtype, operations=operations
+            dtype=dtype
         )
 
         self.face_encoder = FaceEncoder(
-            in_dim=motion_encoder_dim,
-            hidden_dim=self.dim,
-            num_heads=4,
-            device=device, dtype=dtype, operations=operations
+            device, operations,
+            motion_encoder_dim,
+            self.dim,
+            4,
+            dtype=dtype
         )
 
     def after_patch_embedding(self, x, pose_latents, face_pixel_values):

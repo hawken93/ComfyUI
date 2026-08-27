@@ -25,7 +25,7 @@ import comfy.model_prefetch
 import comfy.ops
 import comfy.patcher_extension
 import comfy.quant_ops
-from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention_for_device
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
@@ -131,7 +131,7 @@ def _video_grid(vt, frame, cursor):
 
 
 class TimeEmbedder(nn.Module):
-    def __init__(self, freq_dim, hidden, out, dtype=None, device=None, operations=None):
+    def __init__(self, device, freq_dim, hidden, out, dtype=None, operations=None):
         super().__init__()
         self.freq_dim = freq_dim
         self.proj_in = operations.Linear(freq_dim, hidden, bias=True, dtype=dtype, device=device)
@@ -156,7 +156,7 @@ def rope_rotation_table(angles, dtype):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden, heads, head_dim, eps, dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden, heads, head_dim, eps, dtype=None, operations=None):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
@@ -165,6 +165,7 @@ class Attention(nn.Module):
         self.q_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x, rope_freqs=None, transformer_options={}):
         s = x.shape[0]
@@ -192,12 +193,12 @@ class Attention(nn.Module):
         q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
         k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
         v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
-        out = optimized_attention(q, k, v, self.heads, mask=None, skip_reshape=True, transformer_options=transformer_options)
+        out = self.optimized_attention(q, k, v, self.heads, mask=None, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out.squeeze(0))
 
 
 class MLP(nn.Module):
-    def __init__(self, hidden, ffn, dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden, ffn, dtype=None, operations=None):
         super().__init__()
         self.fc1 = operations.Linear(hidden, ffn * 2, bias=False, dtype=dtype, device=device)
         self.fc2 = operations.Linear(ffn, hidden, bias=False, dtype=dtype, device=device)
@@ -207,8 +208,8 @@ class MLP(nn.Module):
 
 
 class AdalnProj(nn.Module):
-    def __init__(self, t_dim, hidden, expand, modalities, apply_silu=True,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, t_dim, hidden, expand, modalities, apply_silu=True,
+                 dtype=None, operations=None):
         super().__init__()
         self.expand = expand
         self.modalities = modalities
@@ -243,12 +244,12 @@ def _mod_gate(x, gate, other, segments):
 
 
 class RefinerBlock(nn.Module):
-    def __init__(self, hidden, heads, head_dim, ffn, eps, qk_eps, dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden, heads, head_dim, ffn, eps, qk_eps, dtype=None, operations=None):
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
-        self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
+        self.attn = Attention(device, hidden, heads, head_dim, qk_eps, dtype=dtype, operations=operations)
+        self.mlp = MLP(device, hidden, ffn, dtype=dtype, operations=operations)
 
     def forward(self, x, transformer_options={}):
         # attn/mlp outputs are fresh: accumulate residuals in place
@@ -257,11 +258,11 @@ class RefinerBlock(nn.Module):
 
 
 class TokenRefiner(nn.Module):
-    def __init__(self, num_layers, hidden, heads, head_dim, ffn, eps, qk_eps, final_eps,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, num_layers, hidden, heads, head_dim, ffn, eps, qk_eps, final_eps,
+                 dtype=None, operations=None):
         super().__init__()
         self.blocks = nn.ModuleList([
-            RefinerBlock(hidden, heads, head_dim, ffn, eps, qk_eps, dtype=dtype, device=device, operations=operations)
+            RefinerBlock(device, hidden, heads, head_dim, ffn, eps, qk_eps, dtype=dtype, operations=operations)
             for _ in range(num_layers)])
         self.final_norm = operations.RMSNorm(hidden, eps=final_eps, dtype=dtype, device=device)
 
@@ -272,13 +273,13 @@ class TokenRefiner(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
-                 apply_silu=True, adaln_dtype=None, dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
+                 apply_silu=True, adaln_dtype=None, dtype=None, operations=None):
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
-        self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
+        self.attn = Attention(device, hidden, heads, head_dim, qk_eps, dtype=dtype, operations=operations)
+        self.mlp = MLP(device, hidden, ffn, dtype=dtype, operations=operations)
         self.adaln_proj = AdalnProj(t_dim, hidden, 6, 3, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
@@ -292,8 +293,8 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None,
-                 dtype=None, device=None, operations=None):
+    def __init__(self, device, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None,
+                 dtype=None, operations=None):
         super().__init__()
         self.norm = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu,
@@ -439,14 +440,14 @@ class PackedLayout:
 
 
 class MiniMaxH3Model(nn.Module):
-    def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
+    def __init__(self, device, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
                  num_attention_heads=56, attention_head_dim=128, ffn_hidden_size=14336,
                  latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2), text_dim=5120,
                  timestep_input_dim=256, time_embed_hidden_size=5376, time_embed_dim=2688,
                  rope_inv_freq_len=16, norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
                  sigma_shift_video=12.0, sigma_shift_audio=3.0,
                  adaln_curve_grid=None,
-                 image_model=None, dtype=None, device=None, operations=None, **kwargs):
+                 image_model=None, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         self.hidden_size = hidden_size
@@ -467,19 +468,19 @@ class MiniMaxH3Model(nn.Module):
         if self.use_adaln_curves:
             self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=torch.float32))
         else:
-            self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
-                                              dtype=torch.float32, device=device, operations=operations)
+            self.time_embedder = TimeEmbedder(device, timestep_input_dim, time_embed_hidden_size, time_embed_dim,
+                                              dtype=torch.float32, operations=operations)
         self.rope = nn.Module()
         self.rope.register_buffer("inv_freq", torch.empty(rope_inv_freq_len, dtype=torch.float32))
-        self.token_refiner = TokenRefiner(token_refiner_num_layers, hidden_size, num_attention_heads,
+        self.token_refiner = TokenRefiner(device, token_refiner_num_layers, hidden_size, num_attention_heads,
                                           attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps,
-                                          final_norm_eps, dtype=dtype, device=device, operations=operations)
+                                          final_norm_eps, dtype=dtype, operations=operations)
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
-                     time_embed_dim, norm_eps, qk_norm_eps, **curve, dtype=dtype, device=device, operations=operations)
+            DiTBlock(device, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
+                     time_embed_dim, norm_eps, qk_norm_eps, **curve, dtype=dtype, operations=operations)
             for _ in range(num_layers)])
-        self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_patch_dim, audio_latents_dim,
-                                      final_norm_eps, **curve, dtype=dtype, device=device, operations=operations)
+        self.final_layer = FinalLayer(device, hidden_size, time_embed_dim, video_patch_dim, audio_latents_dim,
+                                      final_norm_eps, **curve, dtype=dtype, operations=operations)
 
     def preprocess_text_embeds(self, text_states):
         """[B, L, text_dim] Qwen states -> [B, L, hidden] refined text embeds."""

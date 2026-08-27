@@ -3,11 +3,11 @@ from torch import nn
 import math
 
 import comfy.ldm.common_dit
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.flux.layers import EmbedND
 
-def attention(q, k, v, heads, transformer_options={}):
+def attention(optimized_attention, q, k, v, heads, transformer_options={}):
     return optimized_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
@@ -32,16 +32,15 @@ def get_freqs(dim, max_period=10000.0):
 
 
 class TimeEmbeddings(nn.Module):
-    def __init__(self, model_dim, time_dim, max_period=10000.0, operation_settings=None):
+    def __init__(self, device, operations, model_dim, time_dim, max_period=10000.0, dtype=None):
         super().__init__()
         assert model_dim % 2 == 0
         self.model_dim = model_dim
         self.max_period = max_period
         self.register_buffer("freqs", get_freqs(model_dim // 2, max_period), persistent=False)
-        operations = operation_settings.get("operations")
-        self.in_layer = operations.Linear(model_dim, time_dim, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.in_layer = operations.Linear(model_dim, time_dim, bias=True, device=device, dtype=dtype)
         self.activation = nn.SiLU()
-        self.out_layer = operations.Linear(time_dim, time_dim, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.out_layer = operations.Linear(time_dim, time_dim, bias=True, device=device, dtype=dtype)
 
     def forward(self, timestep, dtype):
         args = torch.outer(timestep, self.freqs.to(device=timestep.device))
@@ -51,11 +50,10 @@ class TimeEmbeddings(nn.Module):
 
 
 class TextEmbeddings(nn.Module):
-    def __init__(self, text_dim, model_dim, operation_settings=None):
+    def __init__(self, device, operations, text_dim, model_dim, dtype=None):
         super().__init__()
-        operations = operation_settings.get("operations")
-        self.in_layer = operations.Linear(text_dim, model_dim, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.norm = operations.LayerNorm(model_dim, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.in_layer = operations.Linear(text_dim, model_dim, bias=True, device=device, dtype=dtype)
+        self.norm = operations.LayerNorm(model_dim, elementwise_affine=True, device=device, dtype=dtype)
 
     def forward(self, text_embed):
         text_embed = self.in_layer(text_embed)
@@ -63,11 +61,10 @@ class TextEmbeddings(nn.Module):
 
 
 class VisualEmbeddings(nn.Module):
-    def __init__(self, visual_dim, model_dim, patch_size, operation_settings=None):
+    def __init__(self, device, operations, visual_dim, model_dim, patch_size, dtype=None):
         super().__init__()
         self.patch_size = patch_size
-        operations = operation_settings.get("operations")
-        self.in_layer = operations.Linear(visual_dim, model_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.in_layer = operations.Linear(visual_dim, model_dim, device=device, dtype=dtype)
 
     def forward(self, x):
         x = x.movedim(1, -1)  # B C T H W -> B T H W C
@@ -86,30 +83,30 @@ class VisualEmbeddings(nn.Module):
 
 
 class Modulation(nn.Module):
-    def __init__(self, time_dim, model_dim, num_params, operation_settings=None):
+    def __init__(self, device, operations, time_dim, model_dim, num_params, dtype=None):
         super().__init__()
         self.activation = nn.SiLU()
-        self.out_layer = operation_settings.get("operations").Linear(time_dim, num_params * model_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.out_layer = operations.Linear(time_dim, num_params * model_dim, device=device, dtype=dtype)
 
     def forward(self, x):
         return self.out_layer(self.activation(x))
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, num_channels, head_dim, operation_settings=None):
+    def __init__(self, device, operations, num_channels, head_dim, dtype=None):
         super().__init__()
         assert num_channels % head_dim == 0
         self.num_heads = num_channels // head_dim
         self.head_dim = head_dim
+        self.optimized_attention = optimized_attention_for_device(device)
 
-        operations = operation_settings.get("operations")
-        self.to_query = operations.Linear(num_channels, num_channels, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.to_key = operations.Linear(num_channels, num_channels, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.to_value = operations.Linear(num_channels, num_channels, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.query_norm = operations.RMSNorm(head_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.key_norm = operations.RMSNorm(head_dim, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.to_query = operations.Linear(num_channels, num_channels, bias=True, device=device, dtype=dtype)
+        self.to_key = operations.Linear(num_channels, num_channels, bias=True, device=device, dtype=dtype)
+        self.to_value = operations.Linear(num_channels, num_channels, bias=True, device=device, dtype=dtype)
+        self.query_norm = operations.RMSNorm(head_dim, device=device, dtype=dtype)
+        self.key_norm = operations.RMSNorm(head_dim, device=device, dtype=dtype)
 
-        self.out_layer = operations.Linear(num_channels, num_channels, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.out_layer = operations.Linear(num_channels, num_channels, bias=True, device=device, dtype=dtype)
         self.num_chunks = 2
 
     def _compute_qk(self, x, freqs, proj_fn, norm_fn):
@@ -120,7 +117,7 @@ class SelfAttention(nn.Module):
         q = self._compute_qk(x, freqs, self.to_query, self.query_norm)
         k = self._compute_qk(x, freqs, self.to_key, self.key_norm)
         v = self.to_value(x).view(*x.shape[:-1], self.num_heads, -1)
-        out = attention(q, k, v, self.num_heads, transformer_options=transformer_options)
+        out = attention(self.optimized_attention, q, k, v, self.num_heads, transformer_options=transformer_options)
         return self.out_layer(out)
 
     def _forward_chunked(self, x, freqs, transformer_options={}):
@@ -135,7 +132,7 @@ class SelfAttention(nn.Module):
         q = process_chunks(self.to_query, self.query_norm)
         k = process_chunks(self.to_key, self.key_norm)
         v = self.to_value(x).view(*x.shape[:-1], self.num_heads, -1)
-        out = attention(q, k, v, self.num_heads, transformer_options=transformer_options)
+        out = attention(self.optimized_attention, q, k, v, self.num_heads, transformer_options=transformer_options)
         return self.out_layer(out)
 
     def forward(self, x, freqs, transformer_options={}):
@@ -154,17 +151,16 @@ class CrossAttention(SelfAttention):
 
     def forward(self, x, context, transformer_options={}):
         q, k, v = self.get_qkv(x, context)
-        out = attention(self.query_norm(q), self.key_norm(k), v, self.num_heads, transformer_options=transformer_options)
+        out = attention(self.optimized_attention, self.query_norm(q), self.key_norm(k), v, self.num_heads, transformer_options=transformer_options)
         return self.out_layer(out)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, ff_dim, operation_settings=None):
+    def __init__(self, device, operations, dim, ff_dim, dtype=None):
         super().__init__()
-        operations = operation_settings.get("operations")
-        self.in_layer = operations.Linear(dim, ff_dim, bias=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.in_layer = operations.Linear(dim, ff_dim, bias=False, device=device, dtype=dtype)
         self.activation = nn.GELU()
-        self.out_layer = operations.Linear(ff_dim, dim, bias=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.out_layer = operations.Linear(ff_dim, dim, bias=False, device=device, dtype=dtype)
         self.num_chunks = 4
 
     def _forward(self, x):
@@ -185,13 +181,12 @@ class FeedForward(nn.Module):
 
 
 class OutLayer(nn.Module):
-    def __init__(self, model_dim, time_dim, visual_dim, patch_size, operation_settings=None):
+    def __init__(self, device, operations, model_dim, time_dim, visual_dim, patch_size, dtype=None):
         super().__init__()
         self.patch_size = patch_size
-        self.modulation = Modulation(time_dim, model_dim, 2, operation_settings=operation_settings)
-        operations = operation_settings.get("operations")
-        self.norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.out_layer = operations.Linear(model_dim, math.prod(patch_size) * visual_dim, bias=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
+        self.modulation = Modulation(device, operations, time_dim, model_dim, 2, dtype=dtype)
+        self.norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=device, dtype=dtype)
+        self.out_layer = operations.Linear(model_dim, math.prod(patch_size) * visual_dim, bias=True, device=device, dtype=dtype)
 
     def forward(self, visual_embed, time_embed):
         B, T, H, W, _ = visual_embed.shape
@@ -211,16 +206,15 @@ class OutLayer(nn.Module):
 
 
 class TransformerEncoderBlock(nn.Module):
-    def __init__(self, model_dim, time_dim, ff_dim, head_dim, operation_settings=None):
+    def __init__(self, device, operations, model_dim, time_dim, ff_dim, head_dim, dtype=None):
         super().__init__()
-        self.text_modulation = Modulation(time_dim, model_dim, 6, operation_settings=operation_settings)
-        operations = operation_settings.get("operations")
+        self.text_modulation = Modulation(device, operations, time_dim, model_dim, 6, dtype=dtype)
 
-        self.self_attention_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.self_attention = SelfAttention(model_dim, head_dim, operation_settings=operation_settings)
+        self.self_attention_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=device, dtype=dtype)
+        self.self_attention = SelfAttention(device, operations, model_dim, head_dim, dtype=dtype)
 
-        self.feed_forward_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.feed_forward = FeedForward(model_dim, ff_dim, operation_settings=operation_settings)
+        self.feed_forward_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=device, dtype=dtype)
+        self.feed_forward = FeedForward(device, operations, model_dim, ff_dim, dtype=dtype)
 
     def forward(self, x, time_embed, freqs, transformer_options={}):
         self_attn_params, ff_params = torch.chunk(self.text_modulation(time_embed), 2, dim=-1)
@@ -237,19 +231,18 @@ class TransformerEncoderBlock(nn.Module):
 
 
 class TransformerDecoderBlock(nn.Module):
-    def __init__(self, model_dim, time_dim, ff_dim, head_dim, operation_settings=None):
+    def __init__(self, device, operations, model_dim, time_dim, ff_dim, head_dim, dtype=None):
         super().__init__()
-        self.visual_modulation = Modulation(time_dim, model_dim, 9, operation_settings=operation_settings)
+        self.visual_modulation = Modulation(device, operations, time_dim, model_dim, 9, dtype=dtype)
 
-        operations = operation_settings.get("operations")
-        self.self_attention_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.self_attention = SelfAttention(model_dim, head_dim, operation_settings=operation_settings)
+        self.self_attention_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=device, dtype=dtype)
+        self.self_attention = SelfAttention(device, operations, model_dim, head_dim, dtype=dtype)
 
-        self.cross_attention_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.cross_attention = CrossAttention(model_dim, head_dim, operation_settings=operation_settings)
+        self.cross_attention_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=device, dtype=dtype)
+        self.cross_attention = CrossAttention(device, operations, model_dim, head_dim, dtype=dtype)
 
-        self.feed_forward_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
-        self.feed_forward = FeedForward(model_dim, ff_dim, operation_settings=operation_settings)
+        self.feed_forward_norm = operations.LayerNorm(model_dim, elementwise_affine=False, device=device, dtype=dtype)
+        self.feed_forward = FeedForward(device, operations, model_dim, ff_dim, dtype=dtype)
 
     def forward(self, visual_embed, text_embed, time_embed, freqs, transformer_options={}):
         self_attn_params, cross_attn_params, ff_params = torch.chunk(self.visual_modulation(time_embed), 3, dim=-1)
@@ -274,10 +267,12 @@ class TransformerDecoderBlock(nn.Module):
 class Kandinsky5(nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         in_visual_dim=16, out_visual_dim=16, in_text_dim=3584, in_text_dim2=768, time_dim=512,
         model_dim=1792, ff_dim=7168, visual_embed_dim=132, patch_size=(1, 2, 2), num_text_blocks=2, num_visual_blocks=32,
         axes_dims=(16, 24, 24), rope_scale_factor=(1.0, 2.0, 2.0),
-        dtype=None, device=None, operations=None, **kwargs
+        dtype=None, **kwargs
     ):
         super().__init__()
         head_dim = sum(axes_dims)
@@ -288,22 +283,21 @@ class Kandinsky5(nn.Module):
         self.visual_embed_dim = visual_embed_dim
         self.dtype = dtype
         self.device = device
-        operation_settings = {"operations": operations, "device": device, "dtype": dtype}
 
-        self.time_embeddings = TimeEmbeddings(model_dim, time_dim, operation_settings=operation_settings)
-        self.text_embeddings = TextEmbeddings(in_text_dim, model_dim, operation_settings=operation_settings)
-        self.pooled_text_embeddings = TextEmbeddings(in_text_dim2, time_dim, operation_settings=operation_settings)
-        self.visual_embeddings = VisualEmbeddings(visual_embed_dim, model_dim, patch_size, operation_settings=operation_settings)
+        self.time_embeddings = TimeEmbeddings(device, operations, model_dim, time_dim, dtype=dtype)
+        self.text_embeddings = TextEmbeddings(device, operations, in_text_dim, model_dim, dtype=dtype)
+        self.pooled_text_embeddings = TextEmbeddings(device, operations, in_text_dim2, time_dim, dtype=dtype)
+        self.visual_embeddings = VisualEmbeddings(device, operations, visual_embed_dim, model_dim, patch_size, dtype=dtype)
 
         self.text_transformer_blocks = nn.ModuleList(
-            [TransformerEncoderBlock(model_dim, time_dim, ff_dim, head_dim, operation_settings=operation_settings) for _ in range(num_text_blocks)]
+            [TransformerEncoderBlock(device, operations, model_dim, time_dim, ff_dim, head_dim, dtype=dtype) for _ in range(num_text_blocks)]
         )
 
         self.visual_transformer_blocks = nn.ModuleList(
-            [TransformerDecoderBlock(model_dim, time_dim, ff_dim, head_dim, operation_settings=operation_settings) for _ in range(num_visual_blocks)]
+            [TransformerDecoderBlock(device, operations, model_dim, time_dim, ff_dim, head_dim, dtype=dtype) for _ in range(num_visual_blocks)]
         )
 
-        self.out_layer = OutLayer(model_dim, time_dim, out_visual_dim, patch_size, operation_settings=operation_settings)
+        self.out_layer = OutLayer(device, operations, model_dim, time_dim, out_visual_dim, patch_size, dtype=dtype)
 
         self.rope_embedder_3d = EmbedND(dim=head_dim, theta=10000.0, axes_dim=axes_dims)
         self.rope_embedder_1d = EmbedND(dim=head_dim, theta=10000.0, axes_dim=[head_dim])

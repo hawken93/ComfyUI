@@ -10,7 +10,7 @@ import comfy.model_management
 import comfy.ops
 import comfy.quant_ops
 import comfy.rmsnorm
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 ops = comfy.ops.disable_weight_init
 
@@ -212,7 +212,7 @@ class FeedForward(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, heads, dim_head, bias=True, eps=1e-5, operations=ops):
+    def __init__(self, device, heads, dim_head, bias=True, eps=1e-5, operations=ops):
         super().__init__()
         self.dim_head = dim_head
         self.heads = heads
@@ -221,6 +221,7 @@ class Attention(nn.Module):
         self.norm_k = ops.RMSNorm(dim_head, eps=eps, elementwise_affine=False)
         self.to_qkv = operations.Linear(inner_dim, inner_dim * 3, bias=bias)
         self.to_out = operations.Linear(inner_dim, inner_dim, bias=bias)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, x, rotary_pos_emb=None):
         batch_size, seq_len, _ = x.shape
@@ -237,17 +238,17 @@ class Attention(nn.Module):
             query[..., :rot], key[..., :rot] = comfy.quant_ops.ck.apply_rope_split_half(
                 query[..., :rot], key[..., :rot], rotary_pos_emb)
 
-        out = optimized_attention(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-                                  self.heads, skip_reshape=True).nan_to_num_(0.0)
+        out = self.optimized_attention(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
+                                       self.heads, skip_reshape=True).nan_to_num_(0.0)
         return self.to_out(out)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, heads, dim_head, bias=True, eps=1e-5, operations=ops):
+    def __init__(self, device, heads, dim_head, bias=True, eps=1e-5, operations=ops):
         super().__init__()
         dim = heads * dim_head
         self.norm1 = ops.RMSNorm(dim, elementwise_affine=True, eps=eps)
-        self.attn = Attention(heads=heads, dim_head=dim_head, bias=bias, eps=eps, operations=operations)
+        self.attn = Attention(device, heads=heads, dim_head=dim_head, bias=bias, eps=eps, operations=operations)
         self.scale1 = nn.Parameter(torch.empty(dim))
         self.norm2 = ops.RMSNorm(dim, elementwise_affine=True, eps=eps)
         self.ff = FeedForward(dim=dim, bias=bias, operations=operations)
@@ -259,7 +260,7 @@ class TransformerBlock(nn.Module):
 
 
 class ViT3DDecoder(nn.Module):
-    def __init__(self, patch_size=16, patch_size_t=4, in_channels=24, out_channels=3, num_layers=36, heads=32, dim_head=64, rope_theta=100.0,
+    def __init__(self, device, patch_size=16, patch_size_t=4, in_channels=24, out_channels=3, num_layers=36, heads=32, dim_head=64, rope_theta=100.0,
                  rope_dim_ratio=0.75, bias=True, eps=1e-5, num_register_tokens=4, operations=ops):
         super().__init__()
         dim = heads * dim_head
@@ -275,7 +276,7 @@ class ViT3DDecoder(nn.Module):
         self.register_buffer("mask_token", torch.empty(1, 1, dim))
 
         self.transformer_blocks = nn.ModuleList(
-            [TransformerBlock(heads=heads, dim_head=dim_head, bias=bias, eps=eps, operations=operations)
+            [TransformerBlock(device, heads=heads, dim_head=dim_head, bias=bias, eps=eps, operations=operations)
              for _ in range(num_layers)]
         )
 
@@ -326,6 +327,7 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     def __init__(
         self,
+        device,
         in_channels=3,
         out_ch=3,
         ch=128,
@@ -343,6 +345,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         operations=ops,
     ):
         super().__init__()
+        self.output_device = comfy.model_management.intermediate_device(device)
         self.vae_ratio = int(math.prod(space_down))
         self.vae_ratio_t = int(math.prod(time_down))
 
@@ -372,6 +375,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         self.quant_conv = ops.Conv3d(z_channels * 2, 2 * embed_dim, 1)
         self.post_quant_conv = ops.Conv3d(embed_dim, z_channels, 1)
         self.decoder = ViT3DDecoder(
+            device,
             patch_size=self.vae_ratio,
             patch_size_t=self.vae_ratio_t,
             in_channels=z_channels,
@@ -613,7 +617,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         if output_buffer is None:
             # finalized chunks stream out of VRAM so the full video never sits on the GPU
             output_buffer = torch.empty(self.decode_output_shape(z.shape), dtype=torch.float32,
-                                        device=comfy.model_management.intermediate_device())
+                                        device=self.output_device)
 
         pad_tokens, num_chunks = self._decode_temporal_chunks(z.shape[2])
         if pad_tokens > 0:

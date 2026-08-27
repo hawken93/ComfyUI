@@ -90,6 +90,7 @@ class GeneralDIT(nn.Module):
 
     def __init__(
         self,
+        device,
         max_img_h: int,
         max_img_w: int,
         max_frames: int,
@@ -124,7 +125,6 @@ class GeneralDIT(nn.Module):
         extra_w_extrapolation_ratio: float = 1.0,
         extra_t_extrapolation_ratio: float = 1.0,
         image_model=None,
-        device=None,
         dtype=None,
         operations=None,
     ) -> None:

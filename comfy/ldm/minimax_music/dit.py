@@ -169,7 +169,7 @@ class DiffusionTransformer(nn.Module):
 
 
 class MiniMaxMusic3DiT(nn.Module):
-    def __init__(self, dtype=None, device=None, operations=None, **kwargs):
+    def __init__(self, device, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.dtype = dtype
         self.latent_conditioners = nn.Sequential(

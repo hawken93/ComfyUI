@@ -364,7 +364,7 @@ class CreateHookModelAsLora:
 
     def __init__(self):
         # when not None, will be in following format:
-        # (ckpt_path: str, weights_model: dict, weights_clip: dict)
+        # (ckpt_path: str, device: str, weights_model: dict, weights_clip: dict)
         self.loaded_weights = None
 
     @classmethod
@@ -376,7 +376,8 @@ class CreateHookModelAsLora:
                 "strength_clip": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
             },
             "optional": {
-                "prev_hooks": ("HOOKS",)
+                "prev_hooks": ("HOOKS",),
+                "device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device used while loading the checkpoint weights. 'default' auto-picks."})
             }
         }
 
@@ -386,7 +387,7 @@ class CreateHookModelAsLora:
     FUNCTION = "create_hook"
 
     def create_hook(self, ckpt_name: str, strength_model: float, strength_clip: float,
-                    prev_hooks: comfy.hooks.HookGroup=None):
+                    prev_hooks: comfy.hooks.HookGroup=None, device: str = "default"):
         if prev_hooks is None:
             prev_hooks = comfy.hooks.HookGroup()
         prev_hooks.clone()
@@ -395,19 +396,21 @@ class CreateHookModelAsLora:
         weights_model = None
         weights_clip = None
         if self.loaded_weights is not None:
-            if self.loaded_weights[0] == ckpt_path:
-                weights_model = self.loaded_weights[1]
-                weights_clip = self.loaded_weights[2]
+            if self.loaded_weights[0] == ckpt_path and self.loaded_weights[1] == device:
+                weights_model = self.loaded_weights[2]
+                weights_clip = self.loaded_weights[3]
             else:
                 temp = self.loaded_weights
                 self.loaded_weights = None
                 del temp
 
         if weights_model is None:
-            out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+            load_device = comfy.model_management.pick_device_for_option(device)
+            offload_device = comfy.model_management.unet_offload_device(load_device)
+            out = comfy.sd.load_checkpoint_guess_config(ckpt_path, load_device, offload_device, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
             weights_model = comfy.hooks.get_patch_weights_from_model(out[0])
             weights_clip = comfy.hooks.get_patch_weights_from_model(out[1].patcher if out[1] else out[1])
-            self.loaded_weights = (ckpt_path, weights_model, weights_clip)
+            self.loaded_weights = (ckpt_path, device, weights_model, weights_clip)
 
         hooks = comfy.hooks.create_hook_model_as_lora(weights_model=weights_model, weights_clip=weights_clip,
                                                       strength_model=strength_model, strength_clip=strength_clip)
@@ -424,7 +427,8 @@ class CreateHookModelAsLoraModelOnly(CreateHookModelAsLora):
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
             },
             "optional": {
-                "prev_hooks": ("HOOKS",)
+                "prev_hooks": ("HOOKS",),
+                "device": (comfy.model_management.get_gpu_device_options(), {"advanced": True, "tooltip": "Device used while loading the checkpoint weights. 'default' auto-picks."})
             }
         }
 
@@ -434,8 +438,8 @@ class CreateHookModelAsLoraModelOnly(CreateHookModelAsLora):
     FUNCTION = "create_hook_model_only"
 
     def create_hook_model_only(self, ckpt_name: str, strength_model: float,
-                               prev_hooks: comfy.hooks.HookGroup=None):
-        return self.create_hook(ckpt_name=ckpt_name, strength_model=strength_model, strength_clip=0.0, prev_hooks=prev_hooks)
+                               prev_hooks: comfy.hooks.HookGroup=None, device: str = "default"):
+        return self.create_hook(ckpt_name=ckpt_name, strength_model=strength_model, strength_clip=0.0, prev_hooks=prev_hooks, device=device)
 #------------------------------------------
 ###########################################
 

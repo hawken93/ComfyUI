@@ -30,24 +30,24 @@ class PixArtMSBlock(nn.Module):
     """
     A PixArt block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., input_size=None,
-                 sampling=None, sr_ratio=1, qk_norm=False, dtype=None, device=None, operations=None, **block_kwargs):
+    def __init__(self, device, operations, hidden_size, num_heads, mlp_ratio=4.0,
+                 sampling=None, sr_ratio=1, qk_norm=False, dtype=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.attn = AttentionKVCompress(
-            hidden_size, num_heads=num_heads, qkv_bias=True, sampling=sampling, sr_ratio=sr_ratio,
-            qk_norm=qk_norm, dtype=dtype, device=device, operations=operations, **block_kwargs
+            device, operations, hidden_size, num_heads=num_heads, qkv_bias=True, sampling=sampling, sr_ratio=sr_ratio,
+            qk_norm=qk_norm, dtype=dtype
         )
         self.cross_attn = MultiHeadCrossAttention(
-            hidden_size, num_heads, dtype=dtype, device=device, operations=operations, **block_kwargs
+            device, operations, hidden_size, num_heads, dtype=dtype
         )
         self.norm2 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(
-            in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu,
-            dtype=dtype, device=device, operations=operations
+            device, operations, hidden_size, int(hidden_size * mlp_ratio), act_layer=approx_gelu,
+            dtype=dtype
         )
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
 
@@ -69,6 +69,8 @@ class PixArtMS(nn.Module):
     """
     def __init__(
             self,
+            device,
+            operations,
             input_size=32,
             patch_size=2,
             in_channels=4,
@@ -79,7 +81,6 @@ class PixArtMS(nn.Module):
             class_dropout_prob=0.1,
             learn_sigma=True,
             pred_sigma=True,
-            drop_path: float = 0.,
             caption_channels=4096,
             pe_interpolation=None,
             pe_precision=None,
@@ -89,8 +90,6 @@ class PixArtMS(nn.Module):
             qk_norm=False,
             kv_compress_config=None,
             dtype=None,
-            device=None,
-            operations=None,
             **kwargs,
     ):
         nn.Module.__init__(self)
@@ -111,34 +110,33 @@ class PixArtMS(nn.Module):
             operations.Linear(hidden_size, 6 * hidden_size, bias=True, dtype=dtype, device=device)
         )
         self.x_embedder = PatchEmbed(
+            device,
+            operations,
             patch_size=patch_size,
             in_chans=in_channels,
             embed_dim=hidden_size,
             bias=True,
             dtype=dtype,
-            device=device,
-            operations=operations
         )
         self.t_embedder = TimestepEmbedder(
-            hidden_size, dtype=dtype, device=device, operations=operations,
+            device, operations, hidden_size, dtype=dtype,
         )
         self.y_embedder = CaptionEmbedder(
-            in_channels=caption_channels, hidden_size=hidden_size, uncond_prob=class_dropout_prob,
+            device, operations, caption_channels, hidden_size, class_dropout_prob,
             act_layer=approx_gelu, token_num=model_max_length,
-            dtype=dtype, device=device, operations=operations,
+            dtype=dtype,
         )
 
         self.micro_conditioning = micro_condition
         if self.micro_conditioning:
-            self.csize_embedder = SizeEmbedder(hidden_size//3, dtype=dtype, device=device, operations=operations)
-            self.ar_embedder = SizeEmbedder(hidden_size//3, dtype=dtype, device=device, operations=operations)
+            self.csize_embedder = SizeEmbedder(device, operations, hidden_size//3, dtype=dtype)
+            self.ar_embedder = SizeEmbedder(device, operations, hidden_size//3, dtype=dtype)
 
         # For fixed sin-cos embedding:
         # num_patches = (input_size // patch_size) * (input_size // patch_size)
         # self.base_size = input_size // self.patch_size
         # self.register_buffer("pos_embed", torch.zeros(1, num_patches, hidden_size))
 
-        drop_path = [x.item() for x in torch.linspace(0, drop_path, depth)]  # stochastic depth decay rule
         if kv_compress_config is None:
             kv_compress_config = {
                 'sampling': None,
@@ -147,18 +145,16 @@ class PixArtMS(nn.Module):
             }
         self.blocks = nn.ModuleList([
             PixArtMSBlock(
-                hidden_size, num_heads, mlp_ratio=mlp_ratio, drop_path=drop_path[i],
+                device, operations, hidden_size, num_heads, mlp_ratio=mlp_ratio,
                 sampling=kv_compress_config['sampling'],
                 sr_ratio=int(kv_compress_config['scale_factor']) if i in kv_compress_config['kv_compress_layer'] else 1,
                 qk_norm=qk_norm,
                 dtype=dtype,
-                device=device,
-                operations=operations,
             )
             for i in range(depth)
         ])
         self.final_layer = T2IFinalLayer(
-            hidden_size, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations
+            device, operations, hidden_size, patch_size, self.out_channels, dtype=dtype
         )
 
     def forward_orig(self, x, timestep, y, mask=None, c_size=None, c_ar=None, **kwargs):

@@ -430,6 +430,7 @@ class SeedVR2TemporalChunk(io.ComfyNode):
             description="Split a SeedVR2 video latent into overlapping temporal chunks small enough to sample one at a time within VRAM, wiring latents outputs to both Apply SeedVR2 Conditioning and the sampler latent input before recombining with Merge SeedVR2 Latents.",
             search_aliases=["seedvr2", "split", "chunk", "temporal", "video upscale", "rebatch"],
             inputs=[
+                io.Model.Input("model", tooltip="The SeedVR2 model. Auto mode budgets chunks against the free memory of its device."),
                 io.Latent.Input("latent", tooltip="The VAE-encoded SeedVR2 latent to split."),
                 io.Int.Input("temporal_overlap", default=0, min=0, max=16384,
                              tooltip="Latent frames shared between adjacent chunks and crossfaded at merge; 0 = no overlap."),
@@ -452,7 +453,7 @@ class SeedVR2TemporalChunk(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent, temporal_overlap, chunking_mode) -> io.NodeOutput:
+    def execute(cls, latent, temporal_overlap, chunking_mode, model=None) -> io.NodeOutput:
         samples = latent["samples"]
         if samples.ndim != 5:
             raise ValueError(
@@ -478,8 +479,9 @@ class SeedVR2TemporalChunk(io.ComfyNode):
         t_pixel = 4 * (t_latent - 1) + 1
 
         if mode == "auto":
-            free_gb = comfy.model_management.get_free_memory(
-                comfy.model_management.get_torch_device()) / (1024 ** 3)
+            if model is None:
+                raise ValueError("SeedVR2TemporalChunk auto mode requires a model to budget against free VRAM")
+            free_gb = comfy.model_management.get_free_memory(model.load_device) / (1024 ** 3)
             mpx_per_frame = (samples.shape[0] * samples.shape[3] * samples.shape[4]) * (BYTEDANCE_VAE_SPATIAL_DOWNSAMPLE ** 2) / 1e6
             budget_gb = free_gb - SEEDVR2_CHUNK_RESERVED_GIB - SEEDVR2_CHUNK_SIGMA_K * SEEDVR2_CHUNK_SIGMA_GIB
             chunk_latent_max = max(1, int(budget_gb / (SEEDVR2_CHUNK_GIB_PER_MPX_FRAME * mpx_per_frame)))

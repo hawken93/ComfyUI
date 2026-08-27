@@ -35,6 +35,7 @@ class MageTimestepProjEmbeddings(nn.Module):
 class MageFlowTransformer2DModel(nn.Module):
     def __init__(
         self,
+        device,
         in_channels: int = 128,
         out_channels: Optional[int] = 128,
         num_layers: int = 12,
@@ -44,7 +45,6 @@ class MageFlowTransformer2DModel(nn.Module):
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
         image_model=None,
         dtype=None,
-        device=None,
         operations=None,
     ):
         super().__init__()

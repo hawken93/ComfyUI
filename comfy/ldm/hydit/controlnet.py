@@ -46,6 +46,8 @@ class HunYuanControlNet(nn.Module):
 
     def __init__(
         self,
+        device,
+        operations,
         input_size: tuple = 128,
         patch_size: int = 2,
         in_channels: int = 4,
@@ -65,8 +67,6 @@ class HunYuanControlNet(nn.Module):
         log_fn: callable = print,
         attn_precision=None,
         dtype=None,
-        device=None,
-        operations=None,
         **kwargs,
     ):
         super().__init__()
@@ -118,13 +118,13 @@ class HunYuanControlNet(nn.Module):
         # Attention pooling
         pooler_out_dim = 1024
         self.pooler = AttentionPool(
+            device,
+            operations,
             self.text_len_t5,
             self.text_states_dim_t5,
             num_heads=8,
             output_dim=pooler_out_dim,
             dtype=dtype,
-            device=device,
-            operations=operations,
         )
 
         # Dimension of the extra input vectors
@@ -143,16 +143,16 @@ class HunYuanControlNet(nn.Module):
 
         # Text embedding for `add`
         self.x_embedder = PatchEmbed(
+            device,
+            operations,
             input_size,
             patch_size,
             in_channels,
             hidden_size,
             dtype=dtype,
-            device=device,
-            operations=operations,
         )
         self.t_embedder = TimestepEmbedder(
-            hidden_size, dtype=dtype, device=device, operations=operations
+            device, operations, hidden_size, dtype=dtype
         )
         self.extra_embedder = nn.Sequential(
             operations.Linear(
@@ -168,9 +168,11 @@ class HunYuanControlNet(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 HunYuanDiTBlock(
-                    hidden_size=hidden_size,
-                    c_emb_size=hidden_size,
-                    num_heads=num_heads,
+                    device,
+                    operations,
+                    hidden_size,
+                    hidden_size,
+                    num_heads,
                     mlp_ratio=mlp_ratio,
                     text_states_dim=self.text_states_dim,
                     qk_norm=qk_norm,
@@ -178,8 +180,6 @@ class HunYuanControlNet(nn.Module):
                     skip=False,
                     attn_precision=attn_precision,
                     dtype=dtype,
-                    device=device,
-                    operations=operations,
                 )
                 for _ in range(19)
             ]

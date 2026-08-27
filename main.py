@@ -289,11 +289,12 @@ import comfy.model_patcher
 
 
 def dynamic_vram_supported():
-    if comfy.model_management.is_nvidia():
-        return True
-    if comfy.model_management.is_amd():
-        if comfy.model_management.rocm_version >= (7, 14):
+    for dev in comfy.model_management.get_all_torch_devices():
+        if comfy.model_management.is_nvidia(dev):
             return True
+        if comfy.model_management.is_amd(dev):
+            if comfy.model_management.rocm_version >= (7, 14):
+                return True
     return False
 
 
@@ -332,15 +333,17 @@ if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supporte
 
 
 def cuda_malloc_warning():
-    device = comfy.model_management.get_torch_device()
-    device_name = comfy.model_management.get_torch_device_name(device)
-    cuda_malloc_warning = False
-    if "cudaMallocAsync" in device_name:
-        for b in cuda_malloc.blacklist:
-            if b in device_name:
-                cuda_malloc_warning = True
-        if cuda_malloc_warning:
-            logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
+    for device in comfy.model_management.get_all_torch_devices():
+        if not comfy.model_management.is_nvidia(device):
+            continue
+        device_name = comfy.model_management.get_torch_device_name(device)
+        cuda_malloc_warn = False
+        if "cudaMallocAsync" in device_name:
+            for b in cuda_malloc.blacklist:
+                if b in device_name:
+                    cuda_malloc_warn = True
+            if cuda_malloc_warn:
+                logging.warning("\nWARNING: %s most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n", device_name)
 
 
 def _collect_output_absolute_paths(history_result: dict) -> list[str]:

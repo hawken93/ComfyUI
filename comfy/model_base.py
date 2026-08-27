@@ -176,7 +176,7 @@ class BaseModel(torch.nn.Module):
                 operations = comfy.ops.pick_operations(unet_config.get("dtype", None), self.manual_cast_dtype, fp8_optimizations=fp8, model_config=model_config)
             else:
                 operations = model_config.custom_operations
-            self.diffusion_model = unet_model(**unet_config, device=device, operations=operations)
+            self.diffusion_model = unet_model(device, operations=operations, **unet_config)
             self.diffusion_model.requires_grad_(False)
             self.diffusion_model.eval()
             if comfy.model_management.force_channels_last():

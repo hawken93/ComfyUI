@@ -22,6 +22,8 @@ class ControlNet(comfy.ldm.modules.diffusionmodules.mmdit.MMDiT):
             control_latent_channels = self.in_channels
 
         self.pos_embed_input = comfy.ldm.modules.diffusionmodules.mmdit.PatchEmbed(
+            device,
+            operations,
             None,
             self.patch_size,
             control_latent_channels,
@@ -29,8 +31,6 @@ class ControlNet(comfy.ldm.modules.diffusionmodules.mmdit.MMDiT):
             bias=True,
             strict_img_size=False,
             dtype=dtype,
-            device=device,
-            operations=operations
         )
 
     def forward(

@@ -3,11 +3,11 @@ import torch.nn as nn
 
 from comfy.ldm.modules.diffusionmodules.util import timestep_embedding
 from comfy.ldm.modules.diffusionmodules.openaimodel import Downsample, TimestepEmbedSequential, ResBlock, SpatialTransformer
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 class ZeroSFT(nn.Module):
-    def __init__(self, label_nc, norm_nc, concat_channels=0, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, label_nc, norm_nc, concat_channels=0, dtype=None):
         super().__init__()
 
         ks = 3
@@ -48,8 +48,9 @@ class ZeroSFT(nn.Module):
 
 class _CrossAttnInner(nn.Module):
     """Inner cross-attention module matching the state_dict layout of the original CrossAttention."""
-    def __init__(self, query_dim, context_dim, heads, dim_head, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, query_dim, context_dim, heads, dim_head, dtype=None):
         super().__init__()
+        self.optimized_attention = optimized_attention_for_device(device)
         inner_dim = dim_head * heads
         self.heads = heads
         self.to_q = operations.Linear(query_dim, inner_dim, bias=False, dtype=dtype, device=device)
@@ -63,15 +64,15 @@ class _CrossAttnInner(nn.Module):
         q = self.to_q(x)
         k = self.to_k(context)
         v = self.to_v(context)
-        return self.to_out(optimized_attention(q, k, v, self.heads))
+        return self.to_out(self.optimized_attention(q, k, v, self.heads))
 
 
 class ZeroCrossAttn(nn.Module):
-    def __init__(self, context_dim, query_dim, dtype=None, device=None, operations=None):
+    def __init__(self, device, operations, context_dim, query_dim, dtype=None):
         super().__init__()
         heads = query_dim // 64
         dim_head = 64
-        self.attn = _CrossAttnInner(query_dim, context_dim, heads, dim_head, dtype=dtype, device=device, operations=operations)
+        self.attn = _CrossAttnInner(device, operations, query_dim, context_dim, heads, dim_head, dtype=dtype)
         self.norm1 = operations.GroupNorm(32, query_dim, dtype=dtype, device=device)
         self.norm2 = operations.GroupNorm(32, context_dim, dtype=dtype, device=device)
 
@@ -91,6 +92,8 @@ class GLVControl(nn.Module):
     """SUPIR's Guided Latent Vector control encoder. Truncated UNet (input + middle blocks only)."""
     def __init__(
         self,
+        device,
+        operations,
         in_channels=4,
         model_channels=320,
         num_res_blocks=2,
@@ -103,8 +106,6 @@ class GLVControl(nn.Module):
         use_linear_in_transformer=True,
         use_checkpoint=False,
         dtype=None,
-        device=None,
-        operations=None,
         **kwargs,
     ):
         super().__init__()
@@ -200,10 +201,10 @@ class SUPIR(nn.Module):
       control_model.*           -> GLVControl
       project_modules.*         -> nn.ModuleList of ZeroSFT/ZeroCrossAttn
     """
-    def __init__(self, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, dtype=None):
         super().__init__()
 
-        self.control_model = GLVControl(dtype=dtype, device=device, operations=operations)
+        self.control_model = GLVControl(device, operations, dtype=dtype)
 
         project_channel_scale = 2
         cond_output_channels = [320] * 4 + [640] * 3 + [1280] * 3
@@ -214,13 +215,13 @@ class SUPIR(nn.Module):
         self.project_modules = nn.ModuleList()
         for i in range(len(cond_output_channels)):
             self.project_modules.append(ZeroSFT(
-                project_channels[i], cond_output_channels[i],
+                device, operations, project_channels[i], cond_output_channels[i],
                 concat_channels=concat_channels[i],
-                dtype=dtype, device=device, operations=operations,
+                dtype=dtype,
             ))
 
         for i in cross_attn_insert_idx:
             self.project_modules.insert(i, ZeroCrossAttn(
-                cond_output_channels[i], concat_channels[i],
-                dtype=dtype, device=device, operations=operations,
+                device, operations, cond_output_channels[i], concat_channels[i],
+                dtype=dtype,
             ))

@@ -14,7 +14,7 @@ except ImportError:
     _HAS_CV2 = False
 
 import comfy.model_management
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.sam3.sam import rope_2d, PositionEmbeddingSine
 from comfy.ops import cast_to_input
 from comfy.ldm.flux.math import apply_rope1
@@ -349,7 +349,7 @@ def use_mask_as_output(backbone_features, high_res_features, mask_inputs, mask_d
 
 # Split attention with configurable input dims (for asymmetric cross-attention)
 class SplitAttn(nn.Module):
-    def __init__(self, embed_dim, num_heads=1, kv_dim=None, internal_dim=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, embed_dim, num_heads=1, kv_dim=None, internal_dim=None, dtype=None, operations=None):
         super().__init__()
         self.num_heads = num_heads
         kv_dim = kv_dim or embed_dim
@@ -358,6 +358,7 @@ class SplitAttn(nn.Module):
         self.k_proj = operations.Linear(kv_dim, internal_dim, device=device, dtype=dtype)
         self.v_proj = operations.Linear(kv_dim, internal_dim, device=device, dtype=dtype)
         self.out_proj = operations.Linear(internal_dim, embed_dim, device=device, dtype=dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, q, k=None, v=None, rope=None, num_k_exclude_rope=0):
         if k is None:
@@ -369,16 +370,16 @@ class SplitAttn(nn.Module):
         v = self.v_proj(v)
         if rope is not None:
             q, k = apply_rope_memory(q, k, rope, self.num_heads, num_k_exclude_rope)
-        out = optimized_attention(q, k, v, self.num_heads, low_precision_attention=False)
+        out = self.optimized_attention(q, k, v, self.num_heads, low_precision_attention=False)
         return self.out_proj(out)
 
 
 class MemoryAttnLayer(nn.Module):
-    def __init__(self, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, dtype=None, operations=None):
         super().__init__()
         self.num_heads = num_heads
-        self.self_attn = SplitAttn(d_model, num_heads, device=device, dtype=dtype, operations=operations)
-        self.cross_attn_image = SplitAttn(d_model, num_heads, kv_dim=kv_dim, device=device, dtype=dtype, operations=operations)
+        self.self_attn = SplitAttn(device, d_model, num_heads, dtype=dtype, operations=operations)
+        self.cross_attn_image = SplitAttn(device, d_model, num_heads, kv_dim=kv_dim, dtype=dtype, operations=operations)
         self.linear1 = operations.Linear(d_model, dim_ff, device=device, dtype=dtype)
         self.linear2 = operations.Linear(dim_ff, d_model, device=device, dtype=dtype)
         self.norm1 = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -395,11 +396,11 @@ class MemoryAttnLayer(nn.Module):
 
 
 class MemoryAttnEncoder(nn.Module):
-    def __init__(self, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, image_size=1008, patch_size=14,
-                 device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, image_size=1008, patch_size=14,
+                 dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
-            MemoryAttnLayer(d_model, num_heads, kv_dim, dim_ff, device=device, dtype=dtype, operations=operations)
+            MemoryAttnLayer(device, d_model, num_heads, kv_dim, dim_ff, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -417,9 +418,9 @@ class MemoryAttnEncoder(nn.Module):
 
 
 class MemoryTransformer(nn.Module):
-    def __init__(self, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=1, kv_dim=64, dim_ff=2048, num_layers=4, dtype=None, operations=None):
         super().__init__()
-        self.encoder = MemoryAttnEncoder(d_model, num_heads, kv_dim, dim_ff, num_layers, device=device, dtype=dtype, operations=operations)
+        self.encoder = MemoryAttnEncoder(device, d_model, num_heads, kv_dim, dim_ff, num_layers, dtype=dtype, operations=operations)
 
 
 def _upscale_masks(output_upscaling, conv_s0, conv_s1, src_out, high_res_features):
@@ -434,7 +435,7 @@ def _upscale_masks(output_upscaling, conv_s0, conv_s1, src_out, high_res_feature
 
 
 class SAMMaskDecoder(nn.Module):
-    def __init__(self, d_model=256, num_multimask_outputs=3, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_multimask_outputs=3, dtype=None, operations=None):
         super().__init__()
         self.num_mask_tokens = num_multimask_outputs + 1
 
@@ -516,7 +517,7 @@ class SAMMaskDecoder(nn.Module):
 
 
 class SAMPromptEncoder(nn.Module):
-    def __init__(self, d_model=256, image_embedding_size=(72, 72), input_image_size=(1008, 1008), device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, image_embedding_size=(72, 72), input_image_size=(1008, 1008), dtype=None, operations=None):
         super().__init__()
         self.embed_dim = d_model
         self.image_embedding_size = image_embedding_size
@@ -578,7 +579,7 @@ class SAMPromptEncoder(nn.Module):
 
 
 class CXBlock(nn.Module):
-    def __init__(self, dim=256, kernel_size=7, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim=256, kernel_size=7, dtype=None, operations=None):
         super().__init__()
         self.dwconv = operations.Conv2d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim, device=device, dtype=dtype)
         self.norm = operations.LayerNorm(dim, device=device, dtype=dtype)
@@ -595,7 +596,7 @@ class CXBlock(nn.Module):
 
 
 class MaskDownSampler(nn.Module):
-    def __init__(self, out_dim=256, in_chans=1, channels=None, interpol_size=(1152, 1152), device=None, dtype=None, operations=None):
+    def __init__(self, device, out_dim=256, in_chans=1, channels=None, interpol_size=(1152, 1152), dtype=None, operations=None):
         super().__init__()
         self.interpol_size = list(interpol_size) if interpol_size else None
         if channels is None:
@@ -617,9 +618,9 @@ class MaskDownSampler(nn.Module):
 
 
 class Fuser(nn.Module):
-    def __init__(self, dim=256, num_layers=2, device=None, dtype=None, operations=None):
+    def __init__(self, device, dim=256, num_layers=2, dtype=None, operations=None):
         super().__init__()
-        self.layers = nn.Sequential(*[CXBlock(dim, device=device, dtype=dtype, operations=operations) for _ in range(num_layers)])
+        self.layers = nn.Sequential(*[CXBlock(device, dim, dtype=dtype, operations=operations) for _ in range(num_layers)])
 
     def forward(self, x):
         return self.layers(x)
@@ -630,7 +631,7 @@ class Fuser(nn.Module):
 class DecoupledMemoryAttnLayer(nn.Module):
     """Decoupled cross-attention layer for SAM3.1: fuses image and memory projections."""
 
-    def __init__(self, d_model=256, num_heads=1, dim_ff=2048, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=1, dim_ff=2048, dtype=None, operations=None):
         super().__init__()
         self.num_heads = num_heads
         # Self-attention projections (flat, not nested)
@@ -652,6 +653,7 @@ class DecoupledMemoryAttnLayer(nn.Module):
         self.norm1 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm2 = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.norm3 = operations.LayerNorm(d_model, device=device, dtype=dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(self, image, x, memory_image, memory, memory_image_pos=None,
                 rope=None, num_k_exclude_rope=0):
@@ -662,7 +664,7 @@ class DecoupledMemoryAttnLayer(nn.Module):
         v = self.self_attn_v_proj(normed)
         if rope is not None:
             q, k = apply_rope_memory(q, k, rope, self.num_heads, 0)
-        x = x + self.self_attn_out_proj(optimized_attention(q, k, v, self.num_heads, low_precision_attention=False))
+        x = x + self.self_attn_out_proj(self.optimized_attention(q, k, v, self.num_heads, low_precision_attention=False))
 
         # Decoupled cross-attention: fuse image and memory projections
         normed = self.norm2(x)
@@ -673,7 +675,7 @@ class DecoupledMemoryAttnLayer(nn.Module):
         v = self.cross_attn_v_proj(memory)
         if rope is not None:
             q, k = apply_rope_memory(q, k, rope, self.num_heads, num_k_exclude_rope)
-        x = x + self.cross_attn_out_proj(optimized_attention(q, k, v, self.num_heads, low_precision_attention=False))
+        x = x + self.cross_attn_out_proj(self.optimized_attention(q, k, v, self.num_heads, low_precision_attention=False))
 
         # FFN
         x = x + self.linear2(F.gelu(self.linear1(self.norm3(x))))
@@ -683,11 +685,11 @@ class DecoupledMemoryAttnLayer(nn.Module):
 class DecoupledMemoryEncoder(nn.Module):
     """Memory attention encoder for SAM3.1 with decoupled cross-attention."""
 
-    def __init__(self, d_model=256, num_heads=1, dim_ff=2048, num_layers=4, image_size=1008, patch_size=14,
-                 device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=1, dim_ff=2048, num_layers=4, image_size=1008, patch_size=14,
+                 dtype=None, operations=None):
         super().__init__()
         self.layers = nn.ModuleList([
-            DecoupledMemoryAttnLayer(d_model, num_heads, dim_ff, device=device, dtype=dtype, operations=operations)
+            DecoupledMemoryAttnLayer(device, d_model, num_heads, dim_ff, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
@@ -728,20 +730,20 @@ class DecoupledMemoryEncoder(nn.Module):
 
 
 class DecoupledMemoryTransformer(nn.Module):
-    def __init__(self, d_model=256, num_heads=1, dim_ff=2048, num_layers=4, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_heads=1, dim_ff=2048, num_layers=4, dtype=None, operations=None):
         super().__init__()
-        self.encoder = DecoupledMemoryEncoder(d_model, num_heads, dim_ff, num_layers,
-                                              device=device, dtype=dtype, operations=operations)
+        self.encoder = DecoupledMemoryEncoder(device, d_model, num_heads, dim_ff, num_layers,
+                                              dtype=dtype, operations=operations)
 
 
 class MemoryBackbone(nn.Module):
     """Memory encoder: downsamples mask, fuses with pixel features, optionally compresses."""
 
-    def __init__(self, d_model=256, out_dim=None, in_chans=1, channels=None, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, out_dim=None, in_chans=1, channels=None, dtype=None, operations=None):
         super().__init__()
-        self.mask_downsampler = MaskDownSampler(d_model, in_chans=in_chans, channels=channels, device=device, dtype=dtype, operations=operations)
+        self.mask_downsampler = MaskDownSampler(device, d_model, in_chans=in_chans, channels=channels, dtype=dtype, operations=operations)
         self.pix_feat_proj = operations.Conv2d(d_model, d_model, kernel_size=1, device=device, dtype=dtype)
-        self.fuser = Fuser(d_model, num_layers=2, device=device, dtype=dtype, operations=operations)
+        self.fuser = Fuser(device, d_model, num_layers=2, dtype=dtype, operations=operations)
         self.has_out_proj = out_dim is not None and out_dim != d_model
         if self.has_out_proj:
             self.out_proj = operations.Conv2d(d_model, out_dim, kernel_size=1, device=device, dtype=dtype)
@@ -772,7 +774,7 @@ class MultiplexMaskDecoder(nn.Module):
     Token order: [obj_score_token(M), iou_token(M), mask_tokens(M*T)].
     """
 
-    def __init__(self, d_model=256, num_multiplex=16, num_multimask_outputs=3, device=None, dtype=None, operations=None):
+    def __init__(self, device, d_model=256, num_multiplex=16, num_multimask_outputs=3, dtype=None, operations=None):
         super().__init__()
         self.num_multiplex = num_multiplex
         self.num_mask_output_per_object = num_multimask_outputs  # 3 (multimask_outputs_only)
@@ -861,18 +863,18 @@ class MultiplexMaskDecoder(nn.Module):
 
 
 class SAM3Tracker(nn.Module):
-    def __init__(self, d_model=256, mem_dim=64, num_maskmem=7, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, d_model=256, mem_dim=64, num_maskmem=7, dtype=None, operations=None, **kwargs):
         super().__init__()
 
         # Memory attention transformer
-        self.transformer = MemoryTransformer(d_model, num_heads=1, kv_dim=mem_dim, dim_ff=2048, num_layers=4,
-                                             device=device, dtype=dtype, operations=operations)
+        self.transformer = MemoryTransformer(device, d_model, num_heads=1, kv_dim=mem_dim, dim_ff=2048, num_layers=4,
+                                              dtype=dtype, operations=operations)
         # SAM components
-        self.sam_mask_decoder = SAMMaskDecoder(d_model, device=device, dtype=dtype, operations=operations)
-        self.sam_prompt_encoder = SAMPromptEncoder(d_model, device=device, dtype=dtype, operations=operations)
+        self.sam_mask_decoder = SAMMaskDecoder(device, d_model, dtype=dtype, operations=operations)
+        self.sam_prompt_encoder = SAMPromptEncoder(device, d_model, dtype=dtype, operations=operations)
 
         # Memory backbone
-        self.maskmem_backbone = MemoryBackbone(d_model, out_dim=mem_dim, device=device, dtype=dtype, operations=operations)
+        self.maskmem_backbone = MemoryBackbone(device, d_model, out_dim=mem_dim, dtype=dtype, operations=operations)
 
         # Standalone parameters
         self.maskmem_tpos_enc = nn.Parameter(torch.zeros(num_maskmem, 1, 1, mem_dim, device=device, dtype=dtype))
@@ -1149,7 +1151,7 @@ class SAM3Tracker(nn.Module):
 class SAM31Tracker(nn.Module):
     """SAM3.1 multiplex tracker: decoupled memory attention, dual decoder, 16-object multiplex."""
 
-    def __init__(self, d_model=256, mem_dim=256, num_maskmem=7, num_multiplex=16, device=None, dtype=None, operations=None, **kwargs):
+    def __init__(self, device, d_model=256, mem_dim=256, num_maskmem=7, num_multiplex=16, dtype=None, operations=None, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.mem_dim = mem_dim
@@ -1162,20 +1164,20 @@ class SAM31Tracker(nn.Module):
         self.sigmoid_bias_for_mem_enc = -1.0
 
         # Memory attention (decoupled cross-attention, 8 heads matching reference)
-        self.transformer = DecoupledMemoryTransformer(d_model, num_heads=8, dim_ff=2048, num_layers=4,
-                                                      device=device, dtype=dtype, operations=operations)
+        self.transformer = DecoupledMemoryTransformer(device, d_model, num_heads=8, dim_ff=2048, num_layers=4,
+                                                      dtype=dtype, operations=operations)
 
         # Propagation decoder (multiplex: 16 objects, multimask_outputs_only)
-        self.sam_mask_decoder = MultiplexMaskDecoder(d_model, num_multiplex, num_multimask_outputs=3,
-                                                     device=device, dtype=dtype, operations=operations)
+        self.sam_mask_decoder = MultiplexMaskDecoder(device, d_model, num_multiplex, num_multimask_outputs=3,
+                                                     dtype=dtype, operations=operations)
         # Interactive decoder (single object, same as SAM3)
-        self.interactive_sam_mask_decoder = SAMMaskDecoder(d_model, num_multimask_outputs=3,
-                                                           device=device, dtype=dtype, operations=operations)
-        self.interactive_sam_prompt_encoder = SAMPromptEncoder(d_model, device=device, dtype=dtype, operations=operations)
+        self.interactive_sam_mask_decoder = SAMMaskDecoder(device, d_model, num_multimask_outputs=3,
+                                                           dtype=dtype, operations=operations)
+        self.interactive_sam_prompt_encoder = SAMPromptEncoder(device, d_model, dtype=dtype, operations=operations)
 
         # Memory backbone (mem_dim=256, no out_proj compression)
-        self.maskmem_backbone = MemoryBackbone(d_model, in_chans=num_multiplex * 2, channels=[16, 64, 256, 1024],
-                                                device=device, dtype=dtype, operations=operations)
+        self.maskmem_backbone = MemoryBackbone(device, d_model, in_chans=num_multiplex * 2, channels=[16, 64, 256, 1024],
+                                              dtype=dtype, operations=operations)
 
         # Standalone parameters
         self.maskmem_tpos_enc = nn.Parameter(torch.zeros(num_maskmem, 1, 1, mem_dim, device=device, dtype=dtype))

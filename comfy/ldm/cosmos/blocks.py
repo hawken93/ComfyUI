@@ -23,7 +23,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 def get_normalization(name: str, channels: int, weight_args={}, operations=None):
@@ -125,6 +125,8 @@ class Attention(nn.Module):
             nn.Dropout(dropout),
         )
 
+        self.optimized_attention = optimized_attention_for_device(weight_args["device"])
+
     def cal_qkv(
         self, x, context=None, mask=None, rope_emb=None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -185,7 +187,7 @@ class Attention(nn.Module):
             context (Optional[Tensor]): The key tensor of shape [B, Mk, K] or use x as context [self attention] if None
         """
         q, k, v = self.cal_qkv(x, context, mask, rope_emb=rope_emb, **kwargs)
-        out = optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True, transformer_options=transformer_options)
+        out = self.optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options)
         del q, k, v
         out = rearrange(out, " b n s c -> s b (n c)")
         return self.to_out(out)

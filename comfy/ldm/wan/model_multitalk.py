@@ -1,7 +1,7 @@
 import torch
 from einops import rearrange, repeat
 import comfy
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 
 def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, split_num=8):
@@ -163,17 +163,20 @@ class RotaryPositionalEmbedding1D(torch.nn.Module):
 class SingleStreamAttention(torch.nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         encoder_hidden_states_dim: int,
         num_heads: int,
         qkv_bias: bool,
-        device=None, dtype=None, operations=None
+        dtype=None
     ) -> None:
         super().__init__()
         self.dim = dim
         self.encoder_hidden_states_dim = encoder_hidden_states_dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.optimized_attention = optimized_attention_for_device(device)
 
         self.q_linear = operations.Linear(dim, dim, bias=qkv_bias, device=device, dtype=dtype)
         self.proj = operations.Linear(dim, dim, device=device, dtype=dtype)
@@ -203,7 +206,7 @@ class SingleStreamAttention(torch.nn.Module):
         encoder_k, encoder_v = kv.view(B * N_t, encoder_hidden_states.shape[1], 2, self.num_heads, self.head_dim).unbind(2)
 
         #print("q.shape", q.shape) #torch.Size([21, 1024, 40, 128])
-        x = optimized_attention(
+        x = self.optimized_attention(
             q.transpose(1, 2),
             encoder_k.transpose(1, 2),
             encoder_v.transpose(1, 2),
@@ -221,22 +224,24 @@ class SingleStreamAttention(torch.nn.Module):
 class SingleStreamMultiAttention(SingleStreamAttention):
     def __init__(
         self,
+        device,
+        operations,
         dim: int,
         encoder_hidden_states_dim: int,
         num_heads: int,
         qkv_bias: bool,
         class_range: int = 24,
         class_interval: int = 4,
-        device=None, dtype=None, operations=None
+        dtype=None
     ) -> None:
         super().__init__(
+            device,
+            operations,
             dim=dim,
             encoder_hidden_states_dim=encoder_hidden_states_dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
-            device=device,
             dtype=dtype,
-            operations=operations
         )
 
         # Rotary-embedding layout parameters
@@ -248,6 +253,7 @@ class SingleStreamMultiAttention(SingleStreamAttention):
         self.rope_bak = int(self.class_range // 2)
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
+        self.optimized_attention = optimized_attention_for_device(device)
 
     def forward(
         self,
@@ -324,7 +330,7 @@ class SingleStreamMultiAttention(SingleStreamAttention):
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
 
-        x = optimized_attention(
+        x = self.optimized_attention(
             q.transpose(1, 2),
             encoder_k.transpose(1, 2),
             encoder_v.transpose(1, 2),
@@ -345,6 +351,8 @@ class SingleStreamMultiAttention(SingleStreamAttention):
 class MultiTalkAudioProjModel(torch.nn.Module):
     def __init__(
         self,
+        device,
+        operations,
         seq_len: int = 5,
         seq_len_vf: int = 12,
         blocks: int = 12,
@@ -352,7 +360,7 @@ class MultiTalkAudioProjModel(torch.nn.Module):
         intermediate_dim: int = 512,
         out_dim: int = 768,
         context_tokens: int = 32,
-        device=None, dtype=None, operations=None
+        dtype=None
     ):
         super().__init__()
 
@@ -408,9 +416,9 @@ class MultiTalkAudioProjModel(torch.nn.Module):
 
 
 class WanMultiTalkAttentionBlock(torch.nn.Module):
-    def __init__(self, in_dim=5120, out_dim=768, device=None, dtype=None, operations=None):
+    def __init__(self, device, operations, in_dim=5120, out_dim=768, dtype=None):
         super().__init__()
-        self.audio_cross_attn = SingleStreamMultiAttention(in_dim, out_dim, num_heads=40, qkv_bias=True, device=device, dtype=dtype, operations=operations)
+        self.audio_cross_attn = SingleStreamMultiAttention(device, operations, in_dim, out_dim, num_heads=40, qkv_bias=True, dtype=dtype)
         self.norm_x = operations.LayerNorm(in_dim, device=device, dtype=dtype, elementwise_affine=True)
 
 

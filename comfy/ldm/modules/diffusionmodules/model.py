@@ -1,4 +1,3 @@
-# pytorch_diffusion + derived encoder decoder
 import math
 import torch
 import torch.nn as nn
@@ -9,7 +8,7 @@ from comfy import model_management
 import comfy.ops
 ops = comfy.ops.disable_weight_init
 
-if model_management.xformers_enabled_vae():
+if model_management.XFORMERS_IS_AVAILABLE and model_management.XFORMERS_ENABLED_VAE:
     import xformers
     import xformers.ops
 
@@ -326,11 +325,11 @@ def pytorch_attention(q, k, v):
     return out
 
 
-def vae_attention():
-    if model_management.xformers_enabled_vae():
+def vae_attention(device):
+    if model_management.xformers_enabled_vae(device):
         logging.info("Using xformers attention in VAE")
         return xformers_attention
-    elif model_management.pytorch_attention_enabled_vae():
+    elif model_management.pytorch_attention_enabled_vae(device):
         logging.info("Using pytorch attention in VAE")
         return pytorch_attention
     else:
@@ -338,7 +337,7 @@ def vae_attention():
         return normal_attention
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels, conv_op=ops.Conv2d, norm_op=Normalize):
+    def __init__(self, device, in_channels, conv_op=ops.Conv2d, norm_op=Normalize):
         super().__init__()
         self.in_channels = in_channels
 
@@ -364,7 +363,7 @@ class AttnBlock(nn.Module):
                                         stride=1,
                                         padding=0)
 
-        self.optimized_attention = vae_attention()
+        self.optimized_attention = vae_attention(device)
 
     def forward(self, x):
         h_ = x
@@ -380,12 +379,12 @@ class AttnBlock(nn.Module):
         return x+h_
 
 
-def make_attn(in_channels, attn_type="vanilla", attn_kwargs=None, conv_op=ops.Conv2d):
-    return AttnBlock(in_channels, conv_op=conv_op)
+def make_attn(device, in_channels, attn_type="vanilla", attn_kwargs=None, conv_op=ops.Conv2d):
+    return AttnBlock(device, in_channels, conv_op=conv_op)
 
 
 class Model(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
+    def __init__(self, device, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, use_timestep=True, use_linear_attn=False, attn_type="vanilla"):
         super().__init__()
@@ -431,7 +430,7 @@ class Model(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    attn.append(make_attn(device, block_in, attn_type=attn_type))
             down = nn.Module()
             down.block = block
             down.attn = attn
@@ -446,7 +445,7 @@ class Model(nn.Module):
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
+        self.mid.attn_1 = make_attn(device, block_in, attn_type=attn_type)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
@@ -468,7 +467,7 @@ class Model(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    attn.append(make_attn(device, block_in, attn_type=attn_type))
             up = nn.Module()
             up.block = block
             up.attn = attn
@@ -538,7 +537,7 @@ class Model(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
+    def __init__(self, device, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, double_z=True, use_linear_attn=False, attn_type="vanilla",
                  conv3d=False, time_compress=None,
@@ -590,7 +589,7 @@ class Encoder(nn.Module):
                                          conv_op=conv_op))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type, conv_op=conv_op))
+                    attn.append(make_attn(device, block_in, attn_type=attn_type, conv_op=conv_op))
             down = nn.Module()
             down.block = block
             down.attn = attn
@@ -615,7 +614,7 @@ class Encoder(nn.Module):
                                        temb_channels=self.temb_ch,
                                        dropout=dropout,
                                        conv_op=conv_op)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type, conv_op=mid_attn_conv_op)
+        self.mid.attn_1 = make_attn(device, block_in, attn_type=attn_type, conv_op=mid_attn_conv_op)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
@@ -683,7 +682,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
+    def __init__(self, device, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, tanh_out=False, use_linear_attn=False,
                  conv_out_op=ops.Conv2d,
@@ -737,7 +736,7 @@ class Decoder(nn.Module):
                                        temb_channels=self.temb_ch,
                                        dropout=dropout,
                                        conv_op=conv_op)
-        self.mid.attn_1 = attn_op(block_in, conv_op=mid_attn_conv_op)
+        self.mid.attn_1 = attn_op(device, block_in, conv_op=mid_attn_conv_op)
         self.mid.block_2 = resnet_op(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,

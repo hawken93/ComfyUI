@@ -50,6 +50,7 @@ class EmptyHunyuanLatentVideo(io.ComfyNode):
                 io.Int.Input("height", default=480, min=16, max=nodes.MAX_RESOLUTION, step=16),
                 io.Int.Input("length", default=25, min=1, max=nodes.MAX_RESOLUTION, step=4),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
+                io.Combo.Input("device", options=["gpu" if o == "default" else o for o in comfy.model_management.get_gpu_device_options()], default="cpu"),
             ],
             outputs=[
                 io.Latent.Output(),
@@ -57,8 +58,10 @@ class EmptyHunyuanLatentVideo(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, width, height, length, batch_size=1) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
+    def execute(cls, width, height, length, batch_size=1, device="cpu") -> io.NodeOutput:
+        device = comfy.model_management.pick_device_for_option("default" if device == "gpu" else device)
+        # Drop model_management.intermediate_device() - The defaults here are so that cpu is used unless overridden.
+        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=device)
         return io.NodeOutput({"samples": latent, "downscale_ratio_spacial": 8})
 
     generate = execute  # TODO: remove
@@ -74,9 +77,11 @@ class EmptyHunyuanVideo15Latent(EmptyHunyuanLatentVideo):
         return schema
 
     @classmethod
-    def execute(cls, width, height, length, batch_size=1) -> io.NodeOutput:
+    def execute(cls, width, height, length, batch_size=1, device="cpu") -> io.NodeOutput:
+        device = comfy.model_management.pick_device_for_option("default" if device == "gpu" else device)
+        # CPU used by default, no intermediate_device(..) call.
         # Using scale factor of 16 instead of 8
-        latent = torch.zeros([batch_size, 32, ((length - 1) // 4) + 1, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+        latent = torch.zeros([batch_size, 32, ((length - 1) // 4) + 1, height // 16, width // 16], device=device)
         return io.NodeOutput({"samples": latent, "downscale_ratio_spacial": 16})
 
 
@@ -106,13 +111,16 @@ class HunyuanVideo15ImageToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, vae, width, height, length, batch_size, start_image=None, clip_vision_output=None) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 32, ((length - 1) // 4) + 1, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+        # Where to store the intermediates
+        intermediate_device = comfy.model_management.intermediate_device(vae.device)
+
+        latent = torch.zeros([batch_size, 32, ((length - 1) // 4) + 1, height // 16, width // 16], device=intermediate_device)
 
         if start_image is not None:
             start_image = comfy.utils.common_upscale(start_image[:length].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
 
             encoded = vae.encode(start_image[:, :, :, :3])
-            concat_latent_image = torch.zeros((latent.shape[0], 32, latent.shape[2], latent.shape[3], latent.shape[4]), device=comfy.model_management.intermediate_device())
+            concat_latent_image = torch.zeros((latent.shape[0], 32, latent.shape[2], latent.shape[3], latent.shape[4]), device=intermediate_device)
             concat_latent_image[:, :, :encoded.shape[2], :, :] = encoded
 
             mask = torch.ones((1, 1, latent.shape[2], concat_latent_image.shape[-2], concat_latent_image.shape[-1]), device=start_image.device, dtype=start_image.dtype)
@@ -158,7 +166,9 @@ class HunyuanVideo15SuperResolution(io.ComfyNode):
     def execute(cls, positive, negative, latent, noise_augmentation, vae=None, start_image=None, clip_vision_output=None) -> io.NodeOutput:
         in_latent = latent["samples"]
         in_channels = in_latent.shape[1]
-        cond_latent = torch.zeros([in_latent.shape[0], in_channels * 2 + 2, in_latent.shape[-3], in_latent.shape[-2], in_latent.shape[-1]], device=comfy.model_management.intermediate_device())
+        intr_device = comfy.model_management.intermediate_device(in_latent.device)
+
+        cond_latent = torch.zeros([in_latent.shape[0], in_channels * 2 + 2, in_latent.shape[-3], in_latent.shape[-2], in_latent.shape[-1]], device=intr_device)
         cond_latent[:, in_channels + 1 : 2 * in_channels + 1] = in_latent
         cond_latent[:, 2 * in_channels + 1] = 1
         if start_image is not None:
@@ -185,6 +195,7 @@ class LatentUpscaleModelLoader(io.ComfyNode):
             category="model/loaders",
             inputs=[
                 io.Combo.Input("model_name", options=folder_paths.get_filename_list("latent_upscale_models")),
+                io.Combo.Input("device", options=comfy.model_management.get_gpu_device_options(), default="default"),
             ],
             outputs=[
                 io.LatentUpscaleModel.Output(),
@@ -192,9 +203,19 @@ class LatentUpscaleModelLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_name) -> io.NodeOutput:
+    def execute(cls, model_name, device="default") -> io.NodeOutput:
         model_path = folder_paths.get_full_path_or_raise("latent_upscale_models", model_name)
         sd, metadata = comfy.utils.load_torch_file(model_path, safe_load=True, return_metadata=True)
+
+        device = comfy.model_management.pick_device_for_option(device)
+
+        # TODO expose on node, but in a sensical way.
+        # i.e. if they have to share device or be on cpu,
+        # this is better as a boolean option,
+        # defaulted by the VRAMState in model_management
+        load_device = comfy.model_management.vae_device(device)
+        vae_offload_device = comfy.model_management.vae_offload_device(device)
+        offload_device = comfy.model_management.unet_offload_device(device)
 
         if "blocks.0.block.0.conv.weight" in sd:
             config = {
@@ -205,7 +226,7 @@ class LatentUpscaleModelLoader(io.ComfyNode):
                 "global_residual": False,
             }
             model_type = "720p"
-            model = HunyuanVideo15SRModel(model_type, config)
+            model = HunyuanVideo15SRModel(load_device, vae_offload_device, model_type, config)
             model.load_sd(sd)
         elif "up.0.block.0.conv1.conv.weight" in sd:
             sd = {key.replace("nin_shortcut", "nin_shortcut.conv", 1): value for key, value in sd.items()}
@@ -215,13 +236,14 @@ class LatentUpscaleModelLoader(io.ComfyNode):
                 "block_out_channels": tuple(sd[f"up.{i}.block.0.conv1.conv.weight"].shape[0] for i in range(len([k for k in sd.keys() if k.startswith("up.") and k.endswith(".block.0.conv1.conv.weight")]))),
             }
             model_type = "1080p"
-            model = HunyuanVideo15SRModel(model_type, config)
+            model = HunyuanVideo15SRModel(load_device, vae_offload_device, model_type, config)
             model.load_sd(sd)
         elif "post_upsample_res_blocks.0.conv2.bias" in sd:
             config = json.loads(metadata["config"])
-            model = LatentUpsampler.from_config(config, operations=comfy.ops.disable_weight_init).to(dtype=comfy.model_management.vae_dtype(allowed_dtypes=[torch.bfloat16, torch.float32]))
+            # TODO can LatentUpsampler.from_config take device directly?
+            model = LatentUpsampler.from_config(config, operations=comfy.ops.disable_weight_init).to(dtype=comfy.model_management.vae_dtype(device, allowed_dtypes=[torch.bfloat16, torch.float32]))
             comfy.model_management.archive_model_dtypes(model)
-            model_patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=comfy.model_management.get_torch_device(), offload_device=comfy.model_management.unet_offload_device())
+            model_patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=device, offload_device=offload_device)
             model.load_state_dict(sd, assign=model_patcher.is_dynamic())
             model = model_patcher
 
@@ -334,7 +356,8 @@ class HunyuanImageToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, vae, width, height, length, batch_size, guidance_type, start_image=None) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
+        intr_device = comfy.model_management.intermediate_device(vae.device)
+        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=intr_device)
         out_latent = {}
 
         if start_image is not None:
@@ -371,6 +394,7 @@ class EmptyHunyuanImageLatent(io.ComfyNode):
                 io.Int.Input("width", default=2048, min=64, max=nodes.MAX_RESOLUTION, step=32),
                 io.Int.Input("height", default=2048, min=64, max=nodes.MAX_RESOLUTION, step=32),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
+                io.Combo.Input("device", options=["gpu" if o == "default" else o for o in comfy.model_management.get_gpu_device_options()], default="cpu"),
             ],
             outputs=[
                 io.Latent.Output(),
@@ -378,8 +402,10 @@ class EmptyHunyuanImageLatent(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, width, height, batch_size=1) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 64, height // 32, width // 32], device=comfy.model_management.intermediate_device())
+    def execute(cls, width, height, batch_size=1, device="cpu") -> io.NodeOutput:
+        device = comfy.model_management.pick_device_for_option("default" if device == "gpu" else device)
+        # intermediate_device(..) not needed as cpu is default
+        latent = torch.zeros([batch_size, 64, height // 32, width // 32], device=device)
         return io.NodeOutput({"samples":latent})
 
     generate = execute  # TODO: remove
@@ -409,10 +435,11 @@ class HunyuanRefinerLatent(io.ComfyNode):
     @classmethod
     def execute(cls, positive, negative, latent, noise_augmentation) -> io.NodeOutput:
         latent = latent["samples"]
+        intr_device = comfy.model_management.intermediate_device(latent.device)
         positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": latent, "noise_augmentation": noise_augmentation})
         negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": latent, "noise_augmentation": noise_augmentation})
         out_latent = {}
-        out_latent["samples"] = torch.zeros([latent.shape[0], 32, latent.shape[-3], latent.shape[-2], latent.shape[-1]], device=comfy.model_management.intermediate_device())
+        out_latent["samples"] = torch.zeros([latent.shape[0], 32, latent.shape[-3], latent.shape[-2], latent.shape[-1]], device=intr_device)
         return io.NodeOutput(positive, negative, out_latent)
 
 

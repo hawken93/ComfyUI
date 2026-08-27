@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 
 import comfy.ops
 ops = comfy.ops.disable_weight_init
@@ -215,6 +215,7 @@ class ResBlock(nn.Module):
 class Attention(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         head_dim: int = 32,
         qkv_bias: bool = False,
@@ -226,6 +227,7 @@ class Attention(nn.Module):
         self.num_heads = dim // head_dim
         self.qk_norm = qk_norm
 
+        self.optimized_attention = optimized_attention_for_device(device)
         self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.out = nn.Linear(dim, dim, bias=out_bias)
 
@@ -264,7 +266,7 @@ class Attention(nn.Module):
             q = F.normalize(q, p=2, dim=-1)
             k = F.normalize(k, p=2, dim=-1)
 
-        x = optimized_attention(q, k, v, self.num_heads, skip_reshape=True)
+        x = self.optimized_attention(q, k, v, self.num_heads, skip_reshape=True)
 
         assert x.size(0) == q.size(0)
 
@@ -276,12 +278,13 @@ class Attention(nn.Module):
 class AttentionBlock(nn.Module):
     def __init__(
         self,
+        device,
         dim: int,
         **attn_kwargs,
     ) -> None:
         super().__init__()
         self.norm = norm_fn(dim)
-        self.attn = Attention(dim, **attn_kwargs)
+        self.attn = Attention(device, dim, **attn_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.attn(self.norm(x))
@@ -325,8 +328,8 @@ class CausalUpsampleBlock(nn.Module):
         return x
 
 
-def block_fn(channels, *, affine: bool = True, has_attention: bool = False, **block_kwargs):
-    attn_block = AttentionBlock(channels) if has_attention else None
+def block_fn(channels, device, *, affine: bool = True, has_attention: bool = False, **block_kwargs):
+    attn_block = AttentionBlock(device, channels) if has_attention else None
     return ResBlock(channels, affine=affine, attn_block=attn_block, **block_kwargs)
 
 
@@ -563,6 +566,7 @@ class LatentDistribution:
 class Encoder(nn.Module):
     def __init__(
         self,
+        device,
         *,
         in_channels: int,
         base_channels: int,
@@ -599,7 +603,7 @@ class Encoder(nn.Module):
 
         assert len(prune_bottlenecks) == num_down_blocks + 2
         assert len(has_attentions) == num_down_blocks + 2
-        block = partial(block_fn, padding_mode=padding_mode, affine=affine, bias=bias)
+        block = partial(block_fn, padding_mode=padding_mode, affine=affine, bias=bias, device=device)
 
         for _ in range(num_res_blocks[0]):
             layers.append(block(ch[0], has_attention=has_attentions[0], prune_bottleneck=prune_bottlenecks[0]))
@@ -619,6 +623,7 @@ class Encoder(nn.Module):
                 affine=affine,
                 bias=bias,
                 padding_mode=padding_mode,
+                device=device,
             )
 
             layers.append(layer)
@@ -671,9 +676,10 @@ class Encoder(nn.Module):
 
 
 class VideoVAE(nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super().__init__()
         self.encoder = Encoder(
+            device,
             in_channels=15,
             base_channels=64,
             channel_multipliers=[1, 2, 4, 6],
@@ -702,6 +708,7 @@ class VideoVAE(nn.Module):
             nonlinearity="silu",
             output_nonlinearity="silu",
             causal=True,
+            device=device,
         )
 
     def encode(self, x):

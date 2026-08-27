@@ -12,7 +12,7 @@ Reference: https://github.com/thu-ml/Causal-Forcing
 import torch
 import torch.nn as nn
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.wan.model import (
     sinusoidal_embedding_1d,
@@ -27,8 +27,8 @@ import comfy.model_management
 class CausalWanSelfAttention(nn.Module):
     """Self-attention with KV cache support for autoregressive inference."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True,
-                 eps=1e-6, operation_settings={}):
+    def __init__(self, device, operations, dim, num_heads, window_size=(-1, -1), qk_norm=True,
+                 eps=1e-6, dtype=None):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -36,17 +36,14 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
         self.eps = eps
+        self.optimized_attention = optimized_attention_for_device(device)
 
-        ops = operation_settings.get("operations")
-        device = operation_settings.get("device")
-        dtype = operation_settings.get("dtype")
-
-        self.q = ops.Linear(dim, dim, device=device, dtype=dtype)
-        self.k = ops.Linear(dim, dim, device=device, dtype=dtype)
-        self.v = ops.Linear(dim, dim, device=device, dtype=dtype)
-        self.o = ops.Linear(dim, dim, device=device, dtype=dtype)
-        self.norm_q = ops.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
-        self.norm_k = ops.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
+        self.q = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.k = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.v = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.o = operations.Linear(dim, dim, device=device, dtype=dtype)
+        self.norm_q = operations.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
+        self.norm_k = operations.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype) if qk_norm else nn.Identity()
 
     def forward(self, x, freqs, kv_cache=None, transformer_options={}):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -56,7 +53,7 @@ class CausalWanSelfAttention(nn.Module):
         v = self.v(x).view(b, s, n, d)
 
         if kv_cache is None:
-            x = optimized_attention(
+            x = self.optimized_attention(
                 q.view(b, s, n * d),
                 k.view(b, s, n * d),
                 v.view(b, s, n * d),
@@ -72,7 +69,7 @@ class CausalWanSelfAttention(nn.Module):
             kv_cache["v"][:, end:new_end] = v
             kv_cache["end"] = new_end
 
-            x = optimized_attention(
+            x = self.optimized_attention(
                 q.view(b, s, n * d),
                 kv_cache["k"][:, :new_end].view(b, new_end, n * d),
                 kv_cache["v"][:, :new_end].view(b, new_end, n * d),
@@ -87,15 +84,16 @@ class CausalWanSelfAttention(nn.Module):
 class CausalWanAttentionBlock(WanAttentionBlock):
     """Transformer block with KV-cached self-attention and cross-attention caching."""
 
-    def __init__(self, cross_attn_type, dim, ffn_dim, num_heads,
-                 window_size=(-1, -1), qk_norm=True, cross_attn_norm=False,
-                 eps=1e-6, operation_settings={}):
-        super().__init__(cross_attn_type, dim, ffn_dim, num_heads,
-                         window_size, qk_norm, cross_attn_norm, eps,
-                         operation_settings=operation_settings)
+    def __init__(self, device, operations, cross_attn_type, dim, ffn_dim,
+                 num_heads, window_size=(-1, -1), qk_norm=True,
+                 cross_attn_norm=False, eps=1e-6, dtype=None):
+        super().__init__(device, operations, cross_attn_type, dim, ffn_dim,
+                         num_heads, window_size, qk_norm, cross_attn_norm,
+                         eps, dtype)
+        self.optimized_attention = optimized_attention_for_device(device)
         self.self_attn = CausalWanSelfAttention(
-            dim, num_heads, window_size, qk_norm, eps,
-            operation_settings=operation_settings)
+            device, operations, dim, num_heads,
+            window_size, qk_norm, eps, dtype)
 
     def forward(self, x, e, freqs, context, context_img_len=257,
                 kv_cache=None, crossattn_cache=None, transformer_options={}):
@@ -115,7 +113,7 @@ class CausalWanAttentionBlock(WanAttentionBlock):
         # Cross-attention with optional caching
         if crossattn_cache is not None and crossattn_cache.get("is_init"):
             q = self.cross_attn.norm_q(self.cross_attn.q(self.norm3(x)))
-            x_ca = optimized_attention(
+            x_ca = self.optimized_attention(
                 q, crossattn_cache["k"], crossattn_cache["v"],
                 heads=self.num_heads, transformer_options=transformer_options)
             x = x + self.cross_attn.o(x_ca)
@@ -141,6 +139,8 @@ class CausalWanModel(WanModel):
     """
 
     def __init__(self,
+                 device,
+                 operations,
                  model_type='t2v',
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -157,17 +157,16 @@ class CausalWanModel(WanModel):
                  cross_attn_norm=True,
                  eps=1e-6,
                  image_model=None,
-                 device=None,
-                 dtype=None,
-                 operations=None):
+                 dtype=None):
         super().__init__(
+            device, operations,
             model_type=model_type, patch_size=patch_size, text_len=text_len,
             in_dim=in_dim, dim=dim, ffn_dim=ffn_dim, freq_dim=freq_dim,
             text_dim=text_dim, out_dim=out_dim, num_heads=num_heads,
             num_layers=num_layers, window_size=window_size, qk_norm=qk_norm,
             cross_attn_norm=cross_attn_norm, eps=eps, image_model=image_model,
             wan_attn_block_class=CausalWanAttentionBlock,
-            device=device, dtype=dtype, operations=operations)
+            dtype=dtype)
 
     def forward_block(self, x, timestep, context, start_frame,
                       kv_caches, crossattn_caches, clip_fea=None):

@@ -60,6 +60,7 @@ def _capture_last_layer_flags(monkeypatch, vid_dim: int, txt_in_dim: int) -> lis
     monkeypatch.setattr(seedvr_model, "NaMMSRTransformerBlock", _Block)
 
     seedvr_model.NaDiT(
+        torch.device("cpu"),
         norm_eps=1e-5,
         num_layers=4,
         mlp_type="normal",
